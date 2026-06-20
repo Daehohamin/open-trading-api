@@ -4,6 +4,7 @@ from datetime import datetime
 from tempfile import TemporaryDirectory
 from typing import Any
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 import requests
 
 from samsung_auto_trader.account import AccountService
@@ -215,7 +216,13 @@ class TestSamsungTrader(unittest.TestCase):
         now = trader._now()
         start_time = datetime.strptime("09:10", "%H:%M").time()
         end_time = datetime.strptime("15:30", "%H:%M").time()
-        self.assertEqual(trader._is_within_trading_window(), start_time <= now.time() <= end_time)
+        self.assertEqual(trader._is_within_trading_window(), now.weekday() < 5 and start_time <= now.time() <= end_time)
+
+    def test_sunday_morning_is_outside_trading_window(self):
+        trader = SamsungTrader(dry_run=True, paper_trading=True, quantity=1)
+        sunday_morning = datetime(2026, 6, 21, 10, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+        with patch.object(trader, "_now", return_value=sunday_morning):
+            self.assertFalse(trader._is_within_trading_window())
 
     def test_inspect_report_continues_when_orders_unavailable(self):
         """Verify inspect/report mode continues gracefully when all APIs fail."""
@@ -294,6 +301,39 @@ class TestSamsungTrader(unittest.TestCase):
                     object.__setattr__(app_config, "outputs_dir", original_outputs_dir)
 
         # The test should not write into the repository outputs directory.
+
+
+class FakeResponse:
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> dict[str, str]:
+        return {"rt_cd": "0"}
+
+
+class TestKISClient(unittest.TestCase):
+    def _client_without_auth(self) -> KISClient:
+        client = KISClient.__new__(KISClient)
+        client.token = "test-token"
+        return client
+
+    def test_buy_order_payload_contains_exchange_code(self):
+        client = self._client_without_auth()
+        with patch("samsung_auto_trader.api_client.requests.post", return_value=FakeResponse()) as post:
+            client.place_order("buy", "005930", 1, 70000)
+
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["EXCG_ID_DVSN_CD"], "KRX")
+        self.assertNotIn("SLL_TYPE", payload)
+
+    def test_sell_order_payload_contains_exchange_code_and_sell_type(self):
+        client = self._client_without_auth()
+        with patch("samsung_auto_trader.api_client.requests.post", return_value=FakeResponse()) as post:
+            client.place_order("sell", "005930", 1, 70000)
+
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["EXCG_ID_DVSN_CD"], "KRX")
+        self.assertEqual(payload["SLL_TYPE"], "01")
 
 
 if __name__ == "__main__":

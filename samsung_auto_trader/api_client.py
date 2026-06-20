@@ -159,7 +159,10 @@ class KISClient:
             "ORD_DVSN": "00",
             "ORD_QTY": str(quantity),
             "ORD_UNPR": str(price),
+            "EXCG_ID_DVSN_CD": "KRX",
         }
+        if action == "sell":
+            data["SLL_TYPE"] = "01"
         headers = {"tr_id": tr_id, "custtype": "P", "tr_cont": ""}
         url = f"{self.BASE_URL}{path}"
         response = requests.post(url, headers={**self._get_headers(), **headers}, json=data, timeout=config.order_timeout_seconds)

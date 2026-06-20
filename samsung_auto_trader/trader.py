@@ -52,6 +52,8 @@ class SamsungTrader:
 
     def _is_within_trading_window(self) -> bool:
         now = self._now()
+        if now.weekday() >= 5:
+            return False
         start = datetime.strptime(config.start_time_str, "%H:%M").time()
         end = datetime.strptime(config.end_time_str, "%H:%M").time()
         return start <= now.time() <= end
