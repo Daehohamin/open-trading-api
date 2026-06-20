@@ -25,12 +25,22 @@ class AccountService:
         if not holdings:
             logger.info("No holdings found in balance response.")
 
-        if isinstance(payload.get("output"), dict):
+        output2 = payload.get("output2")
+        if isinstance(output2, list) and output2:
+            output2 = output2[0]
+
+        if isinstance(output2, dict):
+            available_cash = int(output2.get("ord_psbl_cash", 0) or 0)
+            if available_cash == 0:
+                available_cash = int(output2.get("dnca_tot_amt", 0) or 0)
+            if available_cash == 0:
+                available_cash = int(output2.get("prvs_rcdl_excc_amt", 0) or 0)
+        elif isinstance(payload.get("output"), dict):
             available_cash = int(payload["output"].get("ord_psbl_cash", 0) or 0)
         elif isinstance(payload.get("output"), list) and payload["output"]:
             available_cash = int(payload["output"][0].get("ord_psbl_cash", 0) or 0)
 
-        if available_cash == 0 and isinstance(payload.get("output1"), list):
+        if available_cash == 0 and isinstance(payload.get("output1"), list) and payload["output1"]:
             available_cash = int(payload["output1"][0].get("ord_psbl_cash", 0) or 0)
 
         logger.info("Account available cash: %s", available_cash)

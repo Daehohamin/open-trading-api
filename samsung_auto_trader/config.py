@@ -7,8 +7,12 @@ class Config:
     symbol: str = "005930"
     market_division_code: str = "J"
     order_offset_krw: int = 2000
+    default_order_quantity: int = 1
+    max_order_quantity: int = 10
     start_time_str: str = "09:10"
     end_time_str: str = "15:30"
+    local_timezone: str = "Asia/Seoul"
+    outputs_dir: str = "outputs"
     token_cache_file: str = "token_cache.json"
     default_product_code: str = "01"
     dry_run: bool = True
