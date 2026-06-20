@@ -1,12 +1,16 @@
+import os
 import unittest
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+from datetime import datetime
+from tempfile import TemporaryDirectory
+from typing import Any
+from unittest.mock import patch
 import requests
 
 from samsung_auto_trader.account import AccountService
+from samsung_auto_trader.orders import OrderService
 from samsung_auto_trader.trader import SamsungTrader
 from samsung_auto_trader.api_client import KISClient
-from samsung_auto_trader import config as sat_config
+from samsung_auto_trader.config import config as app_config
 
 
 class DummyClient(KISClient):
@@ -70,6 +74,21 @@ class TestAccountService(unittest.TestCase):
         self.assertEqual(snapshot["available_cash"], 50000)
 
 
+class FakeOrderService(OrderService):
+    def __init__(self) -> None:
+        super().__init__(client=DummyClient(), paper_trading=True)
+        self.buy_calls = 0
+        self.sell_calls = 0
+
+    def place_buy_order(self, symbol: str, quantity: int, price: int) -> dict[str, Any]:
+        self.buy_calls += 1
+        return {"result": "buy_called"}
+
+    def place_sell_order(self, symbol: str, quantity: int, price: int) -> dict[str, Any]:
+        self.sell_calls += 1
+        return {"result": "sell_called"}
+
+
 class TestSamsungTrader(unittest.TestCase):
     def test_quantity_is_capped_and_at_least_one(self):
         payload = {
@@ -78,11 +97,13 @@ class TestSamsungTrader(unittest.TestCase):
         }
         price_payload = {"output": {"stck_prpr": "90000"}}
         dummy_client = DummyClient(balance_payload=payload, price_payload=price_payload)
+        fake_order_service = FakeOrderService()
         trader = SamsungTrader(
             dry_run=True,
             paper_trading=True,
             quantity=100,
             client=dummy_client,
+            order_service=fake_order_service,
         )
         quantity = trader._determine_quantity(90000, 90000)
         self.assertEqual(quantity, 1)
@@ -102,7 +123,92 @@ class TestSamsungTrader(unittest.TestCase):
             client=dummy_client,
         )
         holding = trader.account_service.find_holding(payload["output1"], "005930")
+        self.assertIsNotNone(holding)
+        assert holding is not None
         self.assertEqual(trader._holding_quantity(holding), 0)
+
+    def test_buy_only_submits_only_buy_order(self):
+        payload = {
+            "output1": [{"pdno": "005930", "hldg_qty": "10"}],
+            "output2": {"ord_psbl_cash": "1000000"},
+        }
+        price_payload = {"output": {"stck_prpr": "100000"}}
+        dummy_client = DummyClient(balance_payload=payload, price_payload=price_payload)
+        fake_order_service = FakeOrderService()
+        trader = SamsungTrader(
+            dry_run=False,
+            paper_trading=True,
+            quantity=1,
+            buy_only=True,
+            client=dummy_client,
+            order_service=fake_order_service,
+        )
+        with patch("samsung_auto_trader.trader.time.sleep", return_value=None):
+            trader._run_trade_cycle()
+        self.assertEqual(fake_order_service.buy_calls, 1)
+        self.assertEqual(fake_order_service.sell_calls, 0)
+
+    def test_sell_only_submits_sell_order_when_holdings_sufficient(self):
+        payload = {
+            "output1": [{"pdno": "005930", "hldg_qty": "10"}],
+            "output2": {"ord_psbl_cash": "100000"},
+        }
+        price_payload = {"output": {"stck_prpr": "100000"}}
+        dummy_client = DummyClient(balance_payload=payload, price_payload=price_payload)
+        fake_order_service = FakeOrderService()
+        trader = SamsungTrader(
+            dry_run=False,
+            paper_trading=True,
+            quantity=1,
+            sell_only=True,
+            client=dummy_client,
+            order_service=fake_order_service,
+        )
+        with patch("samsung_auto_trader.trader.time.sleep", return_value=None):
+            trader._run_trade_cycle()
+        self.assertEqual(fake_order_service.sell_calls, 1)
+        self.assertEqual(fake_order_service.buy_calls, 0)
+
+    def test_sell_only_submits_nothing_when_holdings_insufficient(self):
+        payload = {
+            "output1": [{"pdno": "005930", "hldg_qty": "0"}],
+            "output2": {"ord_psbl_cash": "100000"},
+        }
+        price_payload = {"output": {"stck_prpr": "100000"}}
+        dummy_client = DummyClient(balance_payload=payload, price_payload=price_payload)
+        fake_order_service = FakeOrderService()
+        trader = SamsungTrader(
+            dry_run=False,
+            paper_trading=True,
+            quantity=1,
+            sell_only=True,
+            client=dummy_client,
+            order_service=fake_order_service,
+        )
+        with patch("samsung_auto_trader.trader.time.sleep", return_value=None):
+            trader._run_trade_cycle()
+        self.assertEqual(fake_order_service.sell_calls, 0)
+        self.assertEqual(fake_order_service.buy_calls, 0)
+
+    def test_dry_run_submits_no_orders(self):
+        payload = {
+            "output1": [{"pdno": "005930", "hldg_qty": "10"}],
+            "output2": {"ord_psbl_cash": "1000000"},
+        }
+        price_payload = {"output": {"stck_prpr": "100000"}}
+        dummy_client = DummyClient(balance_payload=payload, price_payload=price_payload)
+        fake_order_service = FakeOrderService()
+        trader = SamsungTrader(
+            dry_run=True,
+            paper_trading=True,
+            quantity=1,
+            client=dummy_client,
+            order_service=fake_order_service,
+        )
+        with patch("samsung_auto_trader.trader.time.sleep", return_value=None):
+            trader._run_trade_cycle()
+        self.assertEqual(fake_order_service.buy_calls, 0)
+        self.assertEqual(fake_order_service.sell_calls, 0)
 
     def test_trading_window_timezone(self):
         trader = SamsungTrader(dry_run=True, paper_trading=True, quantity=1)
@@ -110,11 +216,6 @@ class TestSamsungTrader(unittest.TestCase):
         start_time = datetime.strptime("09:10", "%H:%M").time()
         end_time = datetime.strptime("15:30", "%H:%M").time()
         self.assertEqual(trader._is_within_trading_window(), start_time <= now.time() <= end_time)
-
-    def test_trading_window_timezone(self):
-        trader = SamsungTrader(dry_run=True, paper_trading=True, quantity=1)
-        now = datetime.now(ZoneInfo("Asia/Seoul"))
-        self.assertEqual(trader._is_within_trading_window(), trader._now().time() >= datetime.strptime("09:10", "%H:%M").time() and trader._now().time() <= datetime.strptime("15:30", "%H:%M").time())
 
     def test_inspect_report_continues_when_orders_unavailable(self):
         """Verify inspect/report mode continues gracefully when all APIs fail."""
@@ -129,26 +230,31 @@ class TestSamsungTrader(unittest.TestCase):
             client=dummy_client,
         )
         # This should not raise an exception despite all APIs being unavailable
-        trader._run_inspect()
-        # Verify report was still generated with defaults
-        from pathlib import Path
-        report_path = Path("outputs/execution_report.md")
-        self.assertTrue(report_path.exists())
-        report_content = report_path.read_text()
-        # Report should contain "최근 주문내역 조회 불가" since orders list is empty
-        self.assertIn("최근 주문내역 조회 불가", report_content)
-        # Report should show available_cash as 0 due to snapshot failure
-        self.assertIn("Available cash: 0", report_content)
-        # recent_orders.csv must exist even when orders unavailable
-        orders_csv = Path("outputs/recent_orders.csv")
-        self.assertTrue(orders_csv.exists())
+        with TemporaryDirectory() as temp_outputs:
+            original_outputs_dir = app_config.outputs_dir
+            object.__setattr__(app_config, "outputs_dir", temp_outputs)
+            try:
+                trader._run_inspect()
+                from pathlib import Path
+
+                report_path = Path(temp_outputs) / "execution_report.md"
+                self.assertTrue(report_path.exists())
+                report_content = report_path.read_text()
+                self.assertIn("최근 주문내역 조회 불가", report_content)
+                self.assertIn("Available cash: 0", report_content)
+                orders_csv = Path(temp_outputs) / "recent_orders.csv"
+                self.assertTrue(orders_csv.exists())
+            finally:
+                object.__setattr__(app_config, "outputs_dir", original_outputs_dir)
 
     def test_no_sensitive_logs_and_csv_on_error(self):
         """Ensure logs do not contain CANO/account/appkey/appsecret/token/authorization or query strings."""
-        # inject sensitive-looking values into config
-        sat_config.gh_account = "CANO12345"
-        sat_config.gh_appkey = "APPKEY_SECRET"
-        sat_config.gh_appsecret = "APPSECRET_SECRET"
+        # inject sensitive-looking values into environment variables
+        env_updates = {
+            "GH_ACCOUNT": "CANO12345",
+            "GH_APPKEY": "APPKEY_SECRET",
+            "GH_APPSECRET": "APPSECRET_SECRET",
+        }
         dummy_client = DummyClientAllFailure()
         trader = SamsungTrader(
             dry_run=True,
@@ -166,20 +272,28 @@ class TestSamsungTrader(unittest.TestCase):
         stream = StringIO()
         handler = logging.StreamHandler(stream)
         logger.addHandler(handler)
-        try:
-            trader._run_inspect()
-        finally:
-            logger.removeHandler(handler)
+        with patch.dict(os.environ, env_updates, clear=False):
+            with TemporaryDirectory() as temp_outputs:
+                original_outputs_dir = app_config.outputs_dir
+                object.__setattr__(app_config, "outputs_dir", temp_outputs)
+                try:
+                    try:
+                        trader._run_inspect()
+                    finally:
+                        logger.removeHandler(handler)
 
-        logs = stream.getvalue()
-        # Assert sensitive substrings are NOT present
-        self.assertNotIn("CANO=", logs)
-        self.assertNotIn("CANO12345", logs)
-        self.assertNotIn("APPKEY_SECRET", logs)
-        self.assertNotIn("APPSECRET_SECRET", logs)
-        self.assertNotIn("http://", logs)
-        self.assertNotIn("https://", logs)
-        self.assertNotIn("authorization", logs)
+                    logs = stream.getvalue()
+                    self.assertNotIn("CANO=", logs)
+                    self.assertNotIn("CANO12345", logs)
+                    self.assertNotIn("APPKEY_SECRET", logs)
+                    self.assertNotIn("APPSECRET_SECRET", logs)
+                    self.assertNotIn("http://", logs)
+                    self.assertNotIn("https://", logs)
+                    self.assertNotIn("authorization", logs)
+                finally:
+                    object.__setattr__(app_config, "outputs_dir", original_outputs_dir)
+
+        # The test should not write into the repository outputs directory.
 
 
 if __name__ == "__main__":

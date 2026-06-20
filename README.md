@@ -69,6 +69,32 @@
 - `python -m samsung_auto_trader.main --inspect --show-orders --report`
 - `python -m samsung_auto_trader.main --once --dry-run --quantity 1`
 
+## 아키텍처 다이어그램
+```mermaid
+flowchart LR
+    CLI[CLI 입력] -->|args| Trader[SamsungTrader]
+    Trader -->|price| Market[MarketDataService]
+    Trader -->|balance| Account[AccountService]
+    Trader -->|orders| Order[OrderService]
+    Account --> KIS[KISClient]
+    Market --> KIS
+    Order --> KIS
+    Trader --> Report[Report Writer]
+    Report --> Outputs[outputs/*]
+```
+
+## 테스트 요약
+- `tests/test_account_and_trader.py`: 계좌 파싱, 주문 모드, 예외 로깅, 보고서/CSV 생성 검증
+- 모든 테스트는 `python -m unittest discover -s tests -v`로 실행 가능
+
+## Known limitations
+- 현재 구현은 KIS mock REST API 전용이며 websocket 또는 실거래를 지원하지 않습니다.
+- 외부 API가 응답하지 않으면 최신 주문 내역은 `최근 주문내역 조회 불가`로 처리됩니다.
+- 거래 창 외부에서는 실제 주문 로직이 실행되지 않습니다.
+
+## 실제 모의 주문 증빙
+- 증빙 이미지는 실제 호출 환경에 따라 별도로 추가해야 합니다.
+
 ## 실행 증빙
 
 아래 이미지는 모의투자 API 연결과 안전 실행을 확인한 결과입니다. 계좌번호, 인증값, access token 등 민감정보는 가렸습니다.

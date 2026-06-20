@@ -137,7 +137,8 @@ class SamsungTrader:
             report_file.write(f"- Paper trading: {self.paper_trading}\n")
             report_file.write(f"- Token source: {self.client.auth.token_source}\n")
             report_file.write(f"- Current price: {current_price or 'n/a'}\n")
-            report_file.write(f"- Available cash: {account_snapshot.get('available_cash')}\n")
+            available_cash = account_snapshot.get('available_cash')
+            report_file.write(f"- Available cash: {available_cash if available_cash is not None else 'unavailable'}\n")
             holding = self.account_service.find_holding(account_snapshot.get("holdings", []), config.symbol) or {}
             report_file.write(f"- Samsung Electronics holding quantity: {self._holding_quantity(holding)}\n")
             if orders:
@@ -159,7 +160,7 @@ class SamsungTrader:
                 for order in orders:
                     writer.writerow(order)
 
-        cash_value = account_snapshot.get("available_cash", 0)
+        cash_value = account_snapshot.get("available_cash") or 0
         holding = self.account_service.find_holding(account_snapshot.get("holdings", []), config.symbol) or {}
         holding_qty = self._holding_quantity(holding)
         max_cash = max(1, cash_value)
@@ -193,6 +194,21 @@ class SamsungTrader:
             logger.info("  %s", {k: v for k, v in row.items()})
         return orders
 
+    def _record_execution(self, before_snapshot: dict[str, Any], after_snapshot: dict[str, Any]) -> bool:
+        if not before_snapshot or not after_snapshot:
+            return False
+
+        before_cash = before_snapshot.get("available_cash") or 0
+        after_cash = after_snapshot.get("available_cash") or 0
+        if before_cash != after_cash:
+            return True
+
+        before_holding = self.account_service.find_holding(before_snapshot.get("holdings", []), config.symbol) or {}
+        after_holding = self.account_service.find_holding(after_snapshot.get("holdings", []), config.symbol) or {}
+        before_qty = self._holding_quantity(before_holding)
+        after_qty = self._holding_quantity(after_holding)
+        return before_qty != after_qty
+
     def _get_recent_orders_safe(self) -> list[dict[str, Any]]:
         """Retrieve recent orders with graceful error handling.
         
@@ -217,7 +233,7 @@ class SamsungTrader:
         try:
             snapshot = self.account_service.get_account_snapshot()
         except Exception as exc:
-            logger.warning("Account snapshot retrieval failed: %s (continuing with empty snapshot)", type(exc).__name__)
+            logger.warning("Account snapshot retrieval failed: %s (continuing with unavailable snapshot)", type(exc).__name__)
             snapshot = {"available_cash": 0, "holdings": []}
         
         orders = self._get_recent_orders_safe()
@@ -248,18 +264,32 @@ class SamsungTrader:
         order_price_sell = current_price + self.offset
         quantity = self._determine_quantity(before_snapshot["available_cash"], order_price_buy)
 
-        if not self.buy_only:
+        if self.buy_only:
+            if quantity <= 0:
+                logger.info("Buy-only mode: not enough available cash to place a buy order at %s KRW.", order_price_buy)
+            elif self.dry_run:
+                logger.info("DRY_RUN enabled, skipping buy-only order. buy_price=%s qty=%s", order_price_buy, quantity)
+            else:
+                self.order_service.place_buy_order(config.symbol, quantity, order_price_buy)
+        elif self.sell_only:
+            if samsung_qty < self.requested_quantity:
+                logger.info(
+                    "Sell-only mode: skipping sell order because Samsung holdings %s < requested sell quantity %s.",
+                    samsung_qty,
+                    self.requested_quantity,
+                )
+            elif self.dry_run:
+                logger.info("DRY_RUN enabled, skipping sell-only order. sell_price=%s qty=%s", order_price_sell, self.requested_quantity)
+            else:
+                self.order_service.place_sell_order(config.symbol, self.requested_quantity, order_price_sell)
+        else:
             if quantity <= 0:
                 logger.info("Not enough available cash to place a buy order at %s KRW.", order_price_buy)
             elif self.dry_run:
                 logger.info("DRY_RUN enabled, skipping buy order. buy_price=%s qty=%s", order_price_buy, quantity)
             else:
                 self.order_service.place_buy_order(config.symbol, quantity, order_price_buy)
-        else:
-            if quantity > 0:
-                logger.info("Buy-only mode active. Buy quantity=%s at price=%s.", quantity, order_price_buy)
 
-        if not self.sell_only:
             if samsung_qty < self.requested_quantity:
                 logger.info(
                     "Skipping sell order because Samsung holdings %s < requested sell quantity %s.",
@@ -270,8 +300,6 @@ class SamsungTrader:
                 logger.info("DRY_RUN enabled, skipping sell order. sell_price=%s qty=%s", order_price_sell, self.requested_quantity)
             else:
                 self.order_service.place_sell_order(config.symbol, self.requested_quantity, order_price_sell)
-        else:
-            logger.info("Sell-only mode active. No buy order will be submitted.")
 
         if self.show_orders or self.report:
             orders = self._get_recent_orders_safe()
