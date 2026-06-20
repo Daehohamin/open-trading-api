@@ -43,11 +43,13 @@ class KISAuth:
     def __init__(self) -> None:
         self.cache = TokenCache(self.TOKEN_PATH)
         self.access_token = None
+        self.token_source: str = "unknown"
 
     def authenticate(self) -> str:
         saved = self.cache.load()
         if saved and saved.get("access_token"):
             self.access_token = saved["access_token"]
+            self.token_source = "cached"
             logger.info("Reusing cached token for same day.")
             return self.access_token
 
@@ -55,6 +57,7 @@ class KISAuth:
         if env_token:
             self.access_token = env_token.strip()
             if self.access_token:
+                self.token_source = "env"
                 logger.info("Using existing environment token.")
                 self.cache.save(self.access_token)
                 return self.access_token

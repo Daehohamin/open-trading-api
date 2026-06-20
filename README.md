@@ -1,56 +1,20 @@
-# ECO4126 Final Project: Samsung Auto Trader
+# Samsung Electronics Auto Trader
 
-한국투자증권 Open API REST를 이용한 삼성전자(005930) 모의투자 자동매매 시스템 구현 프로젝트 보고서입니다.
+이 프로젝트는 한국투자증권(KIS) Open API REST만을 사용하여 삼성전자(005930) 모의투자 자동매매를 수행하는 Python 시스템입니다. REST 기반으로 안전한 모의투자 주문, 계좌 조회, 보고서 생성을 지원합니다.
 
-## 1. 프로젝트 개요
-이 프로젝트는 한국투자증권(KIS) Open API REST 방식만을 사용하여 삼성전자 005930 종목의 모의투자 자동매매를 수행하는 Python 시스템을 구현합니다. 목표는 모의투자 환경에서 안전하게 지정가 매수/매도 주문을 제출하고 주문 전후 계좌 상태를 확인하는 것입니다.
+## 주요 개선 사항
+- `get_price()`는 `tr_id: FHKST01010100`을 전송합니다.
+- `get_balance()`는 `tr_id: VTTC8434R`과 `CTX_AREA_FK100` / `CTX_AREA_NK100`을 포함합니다.
+- 모의현금 주문 TR ID는 공식 예제 기준 `VTTC0012U`(buy), `VTTC0011U`(sell)입니다.
+- 계좌 조회는 `output1`에서 보유 종목을, `output2`에서 요약/현금을 파싱합니다.
+- 주문 수량은 최소 1주, 최대 `MAX_ORDER_QUANTITY`로 제한됩니다.
+- 삼성전자 보유 수량이 부족하면 매도 주문을 제출하지 않습니다.
+- 거래 시간은 `Asia/Seoul` 기준 `09:10–15:30`으로 계산합니다.
+- 실거래는 항상 비활성화되며 `--no-paper-trading` 사용은 차단됩니다.
+- `--no-dry-run`은 `--confirm-paper-order`와 함께 사용해야 합니다.
+- `--inspect`, `--show-orders`, `--report`, `--quantity`, `--buy-only`, `--sell-only` 옵션을 지원합니다.
 
-## 2. 개발 목표
-- `REST API only` 기반으로 구현
-- `websocket` 미사용
-- `requests` 라이브러리 사용
-- `DRY_RUN=true` 기본 실행
-- `PAPER_TRADING=true` 기본 설정
-- `GH_ACCOUNT`, `GH_APPKEY`, `GH_APPSECRET` 환경변수로 인증 정보 로드
-- `GH_PRODUCT_CODE` 기본값 `01`
-- 한 사이클 실행 후 종료하는 `--once` 옵션 지원
-
-## 3. 시스템 구성
-- `samsung_auto_trader/config.py`: 환경변수 및 기본값 관리
-- `samsung_auto_trader/auth.py`: OAuth 토큰 획득 및 동일일 캐싱
-- `samsung_auto_trader/api_client.py`: REST 공통 요청 처리, 재시도, 토큰 재발급
-- `samsung_auto_trader/market_data.py`: 현재가 조회 기능
-- `samsung_auto_trader/account.py`: 계좌 잔고 및 보유 종목 조회
-- `samsung_auto_trader/orders.py`: 매수/매도 주문 실행
-- `samsung_auto_trader/trader.py`: 거래 루프 및 실행 제어
-- `samsung_auto_trader/logger.py`: 일관된 로그 출력
-
-## 4. 인증 흐름
-1. 환경변수 `GH_ACCOUNT`, `GH_APPKEY`, `GH_APPSECRET` 로드
-2. `auth.py`가 KIS OAuth 토큰 발급 요청 수행
-3. 발급된 토큰을 `token_cache.json`에 저장
-4. 동일한 날짜에는 저장된 토큰을 재사용하여 인증 호출 최소화
-5. `401` 오류 발생 시 자동 재인증으로 토큰 갱신
-
-## 5. 모의투자 및 안전 전략
-- 기본 모드는 `DRY_RUN=true`로 실제 주문을 전송하지 않습니다.
-- 기본 `PAPER_TRADING=true`로 모의투자 TR ID를 사용합니다.
-- `place_order()`는 `paper_trading` 플래그에 따라 모의투자용 TR ID(`VTTC0802U`, `VTTC0801U`) 또는 실거래용 TR ID(`TTTC0802U`, `TTTC0801U`)를 선택합니다.
-- `--no-dry-run`을 사용해야 실제 주문 요청이 전송됩니다.
-- `--once` 옵션으로 한 사이클만 실행하여 테스트에 안전합니다.
-- 거래 시간 외 실행 시 루프를 종료하도록 되어 있습니다.
-
-## 6. 삼성전자 005930 매매 로직
-1. 현재가 조회
-2. 계좌 현금 및 보유 종목 조회
-3. 매수 지정가 = 현재가 - `ORDER_OFFSET_KRW`
-4. 매도 지정가 = 현재가 + `ORDER_OFFSET_KRW`
-5. 매수 가능 수량을 현재가와 현금으로 계산
-6. `DRY_RUN`이 해제된 경우에만 매수/매도 주문 제출
-7. 주문 후 30초 대기 후 계좌 상태 재조회
-8. `--once` 모드로 한 사이클 종료
-
-## 7. 실행 방법
+## 실행 준비
 ### 필수 환경변수
 - `GH_ACCOUNT`
 - `GH_APPKEY`
@@ -59,43 +23,53 @@
 ### 선택 환경변수
 - `GH_PRODUCT_CODE` (기본값 `01`)
 
-### 실행 예시
-- 한 사이클 dry-run 테스트:
-  - `python -m samsung_auto_trader.main --once --dry-run`
-- 모의투자 주문 요청:
-  - `python -m samsung_auto_trader.main --once --no-dry-run`
-- 지속 실행 모드:
-  - `python -m samsung_auto_trader.main`
+## 안전한 실행 명령
+- 도움말 확인:
+  - `python -m samsung_auto_trader.main --help`
+- dry-run 단일 사이클:
+  - `python -m samsung_auto_trader.main --once --dry-run --quantity 1`
+- inspect 읽기 전용 모드:
+  - `python -m samsung_auto_trader.main --inspect --show-orders --report`
+- 모의투자 주문 제출(명시 확인 필요):
+  - `python -m samsung_auto_trader.main --once --no-dry-run --confirm-paper-order --quantity 1`
 
-## 8. 폴더 구조
-```
-open-trading-api/
-  samsung_auto_trader/
-    main.py
-    config.py
-    auth.py
-    api_client.py
-    market_data.py
-    account.py
-    orders.py
-    trader.py
-    logger.py
-    requirements.txt
-    README.md
-  .env.example
-  docs/
-    assets/.gitkeep
-  outputs/.gitkeep
-```
+## 옵션 설명
+- `--once`: 한 사이클만 실행하고 종료
+- `--dry-run`: 주문을 전송하지 않음
+- `--no-dry-run`: 실제 주문 전송 허용 전 단계
+- `--confirm-paper-order`: `--no-dry-run`과 함께 사용해야 함
+- `--paper-trading`: 모의투자 TR ID 사용
+- `--no-paper-trading`: 금지됨(실거래 비활성화 유지)
+- `--offset`: 매수/매도 가격 오프셋
+- `--quantity`: 주문 수량 (기본값 1)
+- `--buy-only`: 매수만 실행
+- `--sell-only`: 매도만 실행
+- `--show-orders`: 최근 주문 내역 표시
+- `--report`: 민감 정보를 제거한 보고서 생성
+- `--inspect`: 읽기 전용 상태 점검
 
-## 9. 안전 설계 요약
-- 기본 `DRY_RUN=true`로 실제 주문 차단
-- 기본 `PAPER_TRADING=true`로 모의투자용 TR ID 사용
-- 동일일 토큰 캐시로 인증 호출 최소화
-- 30초 간격으로 주문 후 계좌 재확인
-- `--once` 옵션으로 안전한 테스트 모드
+## 안전 설계
+- 기본 모드: `dry_run` 및 `paper_trading` 활성화
+- `--no-dry-run`은 `--confirm-paper-order`와 함께만 동작
+- 계좌 현금은 `output2`에서 우선 추출하고 `dnca_tot_amt`/`prvs_rcdl_excc_amt`로 fallback
+- 보유 내역은 `output1`에서 추출
+- 주문 수량은 최소 1주, 최대 `MAX_ORDER_QUANTITY`
+- 거래창은 `Asia/Seoul` 기준 `09:10–15:30`
+- websocket 미사용, REST polling만 사용
 
-## 10. 검증 및 테스트 계획
-- `python -m compileall samsung_auto_trader`로 문법 검사
-- `python -m samsung_auto_trader.main --once --dry-run`로 한 사이클 실행 검증
-- `GH_*` 환경변수를 설정하여 실제 KIS REST 요청 흐름 확인
+## outputs
+- `outputs/execution_report.md`: 실행 보고서
+- `outputs/recent_orders.csv`: 최근 주문 기록
+- `outputs/account_summary.svg`: 계좌 요약 시각화
+
+## 검증 명령
+- `python -m compileall samsung_auto_trader`
+- `python -m unittest discover -s tests -v`
+- `python -m samsung_auto_trader.main --help`
+- `python -m samsung_auto_trader.main --inspect --show-orders --report`
+- `python -m samsung_auto_trader.main --once --dry-run --quantity 1`
+
+## 증빙
+- `--inspect`는 주문을 전송하지 않고 계좌/주문 기록을 조회합니다.
+- `--report`는 계좌 번호, App Key, App Secret, 토큰 등의 민감 정보를 포함하지 않습니다.
+- `--once --dry-run --quantity 1`은 실제 주문을 제출하지 않고 동작을 검증합니다.
