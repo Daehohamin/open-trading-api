@@ -69,7 +69,24 @@
 - `python -m samsung_auto_trader.main --inspect --show-orders --report`
 - `python -m samsung_auto_trader.main --once --dry-run --quantity 1`
 
-## 증빙
-- `--inspect`는 주문을 전송하지 않고 계좌/주문 기록을 조회합니다.
-- `--report`는 계좌 번호, App Key, App Secret, 토큰 등의 민감 정보를 포함하지 않습니다.
-- `--once --dry-run --quantity 1`은 실제 주문을 제출하지 않고 동작을 검증합니다.
+## 실행 증빙
+
+아래 이미지는 모의투자 API 연결과 안전 실행을 확인한 결과입니다. 계좌번호, 인증값, access token 등 민감정보는 가렸습니다.
+
+### Postman OAuth 토큰 발급 성공
+
+KIS Developers 모의투자 인증정보로 `V_토큰발급` 요청을 실행해 `200 OK`와 Bearer token 발급을 확인했습니다.
+
+![Postman OAuth token success](docs/assets/postman_token_success.png)
+
+### Postman 모의투자 잔고조회 성공
+
+발급된 token으로 국내주식 잔고조회 요청을 실행해 `rt_cd: "0"`과 모의투자 계좌 응답을 확인했습니다.
+
+![Postman balance inquiry success](docs/assets/postman_balance_success.png)
+
+### GitHub Codespaces dry-run 성공
+
+Codespaces 환경변수를 사용하여 dry-run 모드로 한 사이클 실행을 검증했습니다. 실행 결과 당일 token cache를 재사용했고, `dry_run=True`, `paper_trading=True` 상태에서 거래시간 외 주문 차단 로직이 정상 작동했습니다.
+
+![Codespaces dry-run success](docs/assets/codespace_dry_run_success.png)
