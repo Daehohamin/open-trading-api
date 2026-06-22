@@ -94,8 +94,42 @@ flowchart LR
 
 ## 실제 모의투자 주문 증빙
 
-OAuth 토큰 발급, 모의계좌 잔고조회, dry-run 실행까지 검증했습니다.  
-실제 모의주문 접수 및 체결 결과는 2026년 6월 22일 장중 실행 후 증빙 이미지와 함께 추가할 예정입니다.
+아래 결과는 2026년 6월 22일 KIS 모의투자 환경에서 실행한 mock trading 증빙이며, live trading이 아닙니다.
+
+- 종목: 삼성전자 005930
+- 주문 유형: 지정가 매수
+- 주문 수량: 1주
+- 주문 가격: 353,500 KRW
+- 주문 시각: 13:02:56 KST
+- 체결 수량: 1주
+- 미체결 수량: 0주
+- 최종 상태: 전량 체결
+- 체결 후 계좌 점검: 보유 수량 1주 확인
+- 최근 주문 건수: 1건
+
+실행 명령:
+
+```bash
+python -m samsung_auto_trader.main \
+  --once \
+  --no-dry-run \
+  --confirm-paper-order \
+  --quantity 1 \
+  --buy-only \
+  --offset 2000
+```
+
+### eFriend 모의투자 체결 내역
+
+![eFriend 모의투자 체결 내역](docs/assets/mock_trade_efriend_filled.png)
+
+### Codespaces 체결 후 계좌 확인
+
+![Codespaces 체결 후 계좌 확인](docs/assets/mock_trade_codespaces_holding.png)
+
+### 한투 앱 체결 후 보유 잔고
+
+![한투 앱 체결 후 보유 잔고](docs/assets/mock_trade_mobile_holding.png)
 
 ## 실행 증빙
 
