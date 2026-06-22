@@ -25,14 +25,164 @@
 
 ## 재현 및 운영 절차
 
-### 1. 코드 및 테스트 검증
+아래 절차는 환경 확인, 코드 검증, 읽기 전용 조회, dry-run,
+모의투자 주문, 주문 후 확인 순서로 구성됩니다.
+모든 명령은 저장소 루트에서 실행합니다.
+
+### 1. 저장소 및 환경 확인
 
 ```bash
 cd /workspaces/open-trading-api
 git pull --ff-only origin main
+git status --short
+
+python - <<'PY'
+import os
+
+for name in ["GH_ACCOUNT", "GH_APPKEY", "GH_APPSECRET", "GH_PRODUCT_CODE"]:
+    print(name, "OK" if os.getenv(name) else "MISSING")
+PY
+```
+
+`git status --short`에 출력이 없고 환경변수가 모두 `OK`이면 실행 준비가 완료된 상태입니다.
+위 명령은 인증정보의 실제 값을 출력하지 않고 설정 여부만 확인합니다.
+
+### 2. 코드 및 테스트 검증
+
+```bash
 python -m compileall samsung_auto_trader
 python -m unittest discover -s tests -v
+python -m samsung_auto_trader.main --help
 ```
+
+- `compileall`은 Python 문법 오류를 검사합니다.
+- 단위 테스트는 계좌 파싱, 주문 분기, 요청 제한, 예외 처리와 민감정보 제거를 검증합니다.
+- 테스트에서는 실제 KIS 주문을 전송하지 않습니다.
+- `--help`는 실행 가능한 CLI 옵션을 확인합니다.
+
+### 3. 읽기 전용 현재 상태 조회
+
+```bash
+python -m samsung_auto_trader.main \
+  --inspect \
+  --show-orders
+```
+
+이 명령은 주문을 제출하지 않고 다음 항목만 조회합니다.
+
+1. 삼성전자 현재가
+2. 모의계좌 가용현금
+3. 삼성전자 보유수량
+4. 최근 모의투자 주문내역
+5. 당일 token cache 재사용 여부
+
+보고서 파일도 새로 생성하려면 다음 명령을 사용합니다.
+
+```bash
+python -m samsung_auto_trader.main \
+  --inspect \
+  --show-orders \
+  --report
+
+cat outputs/execution_report.md
+```
+
+`--report` 사용 시 `outputs/execution_report.md`,
+`outputs/recent_orders.csv`, `outputs/account_summary.svg`가 갱신됩니다.
+
+### 4. 주문 없는 dry-run
+
+```bash
+python -m samsung_auto_trader.main \
+  --once \
+  --dry-run \
+  --quantity 1 \
+  --buy-only \
+  --offset 2000
+```
+
+dry-run은 실제 KIS 현재가와 계좌를 조회한 뒤 매수 가격과 수량을 계산하지만
+주문 POST 요청은 전송하지 않습니다.
+
+정상 실행 시 다음과 유사한 로그가 표시됩니다.
+
+```text
+DRY_RUN enabled, skipping buy-only order.
+```
+
+### 5. KIS 모의투자 주문 제출
+
+> [!WARNING]
+> 아래 명령은 실거래가 아닌 KIS 모의투자 주문을 실제로 제출합니다.
+> 평일 09:10–15:30 KST에 기존 보유수량과 미체결 주문을 확인한 뒤 한 번만 실행합니다.
+> 이전 요청의 성공 여부가 불분명하면 같은 주문을 반복하지 않습니다.
+
+```bash
+python -m samsung_auto_trader.main \
+  --once \
+  --no-dry-run \
+  --confirm-paper-order \
+  --quantity 1 \
+  --buy-only \
+  --offset 2000
+```
+
+명령 옵션의 의미는 다음과 같습니다.
+
+| 옵션 | 의미 |
+|---|---|
+| `--once` | 한 번의 거래 사이클만 실행한 뒤 종료 |
+| `--no-dry-run` | 주문 전송을 허용 |
+| `--confirm-paper-order` | 모의주문 전송 의사를 명시적으로 확인 |
+| `--quantity 1` | 주문수량을 1주로 지정 |
+| `--buy-only` | 매수 주문만 실행 |
+| `--offset 2000` | 현재가보다 2,000원 낮은 지정가 매수 가격 계산 |
+
+보유한 삼성전자 1주를 이용하여 매도 경로를 확인할 때는
+`--buy-only`를 `--sell-only`로 변경합니다.
+한 번의 시연에서는 두 옵션 중 하나만 사용합니다.
+
+정상 접수 시 다음과 유사한 로그가 표시됩니다.
+
+```text
+Order accepted: rt_cd=0 order_number=...
+모의투자 매수주문이 완료되었습니다.
+```
+
+### 6. 주문 후 체결 및 계좌 확인
+
+```bash
+python -m samsung_auto_trader.main \
+  --inspect \
+  --show-orders \
+  --report
+
+cat outputs/execution_report.md
+```
+
+다음 항목을 확인합니다.
+
+- 최근 주문 건수
+- 주문수량과 주문가격
+- 체결 또는 미체결 상태
+- 삼성전자 보유수량
+- 주문 전후 계좌 상태
+
+최종 체결 상태는 eFriend 모의투자 당일주문체결 화면과 한투 앱 보유잔고에서도 확인합니다.
+
+### 7. 내부 처리 흐름
+
+1. Codespaces Secrets에서 계좌번호와 API 인증정보를 읽습니다.
+2. 당일 발급된 OAuth token이 있으면 cache에서 재사용합니다.
+3. 삼성전자 `005930` 현재가를 REST API로 조회합니다.
+4. 모의계좌 가용현금과 보유수량을 조회합니다.
+5. 매수 가격은 `현재가 - 2,000원`, 매도 가격은 `현재가 + 2,000원`으로 계산합니다.
+6. dry-run이 아니고 명시 확인 옵션이 있을 때만 모의주문을 전송합니다.
+7. 주문 후 계좌와 주문내역을 다시 조회하여 체결 여부를 확인합니다.
+8. `--once` 모드에서는 한 사이클 후 종료합니다.
+
+KIS 모의투자의 낮은 호출 제한을 고려하여 REST 요청 사이에는 기본 1.2초 간격을 적용하고,
+주문 POST 요청은 중복 주문 위험 때문에 자동 재시도하지 않습니다.
 
 ## 옵션 설명
 - `--once`: 한 사이클만 실행하고 종료
