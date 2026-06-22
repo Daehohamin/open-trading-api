@@ -23,15 +23,16 @@
 ### 선택 환경변수
 - `GH_PRODUCT_CODE` (기본값 `01`)
 
-## 안전한 실행 명령
-- 도움말 확인:
-  - `python -m samsung_auto_trader.main --help`
-- dry-run 단일 사이클:
-  - `python -m samsung_auto_trader.main --once --dry-run --quantity 1`
-- inspect 읽기 전용 모드:
-  - `python -m samsung_auto_trader.main --inspect --show-orders --report`
-- 모의투자 주문 제출(명시 확인 필요):
-  - `python -m samsung_auto_trader.main --once --no-dry-run --confirm-paper-order --quantity 1`
+## 재현 및 운영 절차
+
+### 1. 코드 및 테스트 검증
+
+```bash
+cd /workspaces/open-trading-api
+git pull --ff-only origin main
+python -m compileall samsung_auto_trader
+python -m unittest discover -s tests -v
+```
 
 ## 옵션 설명
 - `--once`: 한 사이클만 실행하고 종료
