@@ -65,10 +65,9 @@ class SamsungTrader:
         else:
             logger.info("Trading window is closed.")
 
-    def _determine_quantity(self, available_cash: int, price: int) -> int:
-        if price <= 0:
+    def _determine_quantity(self, buying_power_quantity: int | None) -> int:
+        if buying_power_quantity is None or buying_power_quantity <= 0:
             return 0
-
         quantity = max(1, self.requested_quantity)
         capped_quantity = min(quantity, config.max_order_quantity)
         if capped_quantity != quantity:
@@ -78,17 +77,26 @@ class SamsungTrader:
                 config.max_order_quantity,
             )
 
-        affordable_quantity = available_cash // price
-        if affordable_quantity <= 0:
-            return 0
-
-        final_quantity = min(capped_quantity, affordable_quantity)
+        final_quantity = min(capped_quantity, buying_power_quantity)
         if final_quantity != capped_quantity:
             logger.warning(
-                "Order quantity reduced to affordable amount %s based on available cash.",
+                "Order quantity reduced to buying-power quantity %s.",
                 final_quantity,
             )
         return final_quantity
+
+    def _get_buying_power_safe(self, symbol: str, order_price: int) -> dict[str, int | None]:
+        try:
+            buying_power = self.client.get_buying_power(symbol, order_price)
+        except Exception as exc:
+            logger.warning("Buying power retrieval failed: %s (no balance fallback will be used)", type(exc).__name__)
+            return {"buying_power_amount": None, "buying_power_quantity": None}
+        logger.info(
+            "Buying power: amount=%s quantity=%s",
+            buying_power.get("buying_power_amount"),
+            buying_power.get("buying_power_quantity"),
+        )
+        return buying_power
 
     def _holding_quantity(self, holding: dict[str, Any]) -> int:
         for key in ["hldg_qty", "hldg_qty1", "ord_psbl_qty", "qty", "pdqty", "ord_qty"]:
@@ -140,8 +148,18 @@ class SamsungTrader:
             report_file.write(f"- Paper trading: {self.paper_trading}\n")
             report_file.write(f"- Token source: {self.client.auth.token_source}\n")
             report_file.write(f"- Current price: {current_price or 'n/a'}\n")
-            available_cash = account_snapshot.get('available_cash')
-            report_file.write(f"- Available cash: {available_cash if available_cash is not None else 'unavailable'}\n")
+            report_file.write(f"- Deposit total: {self._format_optional_amount(account_snapshot.get('deposit_total'))}\n")
+            report_file.write(
+                f"- Next-day settlement amount: {self._format_optional_amount(account_snapshot.get('next_day_settlement_amount'))}\n"
+            )
+            report_file.write(
+                f"- Provisional settlement amount: {self._format_optional_amount(account_snapshot.get('provisional_settlement_amount'))}\n"
+            )
+            if "buying_power_amount" in account_snapshot or "buying_power_quantity" in account_snapshot:
+                report_file.write(f"- Buying power amount: {self._format_optional_amount(account_snapshot.get('buying_power_amount'))}\n")
+                report_file.write(f"- Buying power quantity: {self._format_optional_amount(account_snapshot.get('buying_power_quantity'))}\n")
+            else:
+                report_file.write("- Buying power: not queried\n")
             holding = self.account_service.find_holding(account_snapshot.get("holdings", []), config.symbol) or {}
             report_file.write(f"- Samsung Electronics holding quantity: {self._holding_quantity(holding)}\n")
             if orders:
@@ -163,11 +181,11 @@ class SamsungTrader:
                 for order in orders:
                     writer.writerow(order)
 
-        cash_value = account_snapshot.get("available_cash") or 0
+        deposit_total = account_snapshot.get("deposit_total") or 0
         holding = self.account_service.find_holding(account_snapshot.get("holdings", []), config.symbol) or {}
         holding_qty = self._holding_quantity(holding)
-        max_cash = max(1, cash_value)
-        bar_cash = int(min(300, cash_value / max_cash * 300)) if cash_value else 0
+        max_deposit = max(1, deposit_total)
+        bar_deposit = int(min(300, deposit_total / max_deposit * 300)) if deposit_total else 0
         bar_holding = int(min(300, holding_qty / max(1, holding_qty) * 300)) if holding_qty else 0
 
         svg_template = f"""<?xml version='1.0' encoding='UTF-8'?>
@@ -175,10 +193,10 @@ class SamsungTrader:
   <rect width='450' height='140' fill='#f8f9fa' />
   <text x='20' y='30' font-size='14' fill='#212529'>Samsung Auto Trader Summary</text>
   <text x='20' y='55' font-size='12' fill='#495057'>Price: {current_price or 'n/a'} KRW</text>
-  <text x='20' y='72' font-size='12' fill='#495057'>Available cash: {cash_value}</text>
+  <text x='20' y='72' font-size='12' fill='#495057'>Deposit total: {deposit_total}</text>
   <text x='20' y='89' font-size='12' fill='#495057'>Holding qty: {holding_qty}</text>
-  <rect x='20' y='100' width='{bar_cash}' height='16' fill='#0d6efd' />
-  <text x='20' y='132' font-size='11' fill='#ffffff'>Cash bar</text>
+  <rect x='20' y='100' width='{bar_deposit}' height='16' fill='#0d6efd' />
+  <text x='20' y='132' font-size='11' fill='#ffffff'>Deposit bar</text>
   <rect x='200' y='100' width='{bar_holding}' height='16' fill='#198754' />
   <text x='200' y='132' font-size='11' fill='#ffffff'>Holding bar</text>
 </svg>
@@ -200,11 +218,6 @@ class SamsungTrader:
     def _record_execution(self, before_snapshot: dict[str, Any], after_snapshot: dict[str, Any]) -> bool:
         if not before_snapshot or not after_snapshot:
             return False
-
-        before_cash = before_snapshot.get("available_cash") or 0
-        after_cash = after_snapshot.get("available_cash") or 0
-        if before_cash != after_cash:
-            return True
 
         before_holding = self.account_service.find_holding(before_snapshot.get("holdings", []), config.symbol) or {}
         after_holding = self.account_service.find_holding(after_snapshot.get("holdings", []), config.symbol) or {}
@@ -237,7 +250,12 @@ class SamsungTrader:
             snapshot = self.account_service.get_account_snapshot()
         except Exception as exc:
             logger.warning("Account snapshot retrieval failed: %s (continuing with unavailable snapshot)", type(exc).__name__)
-            snapshot = {"available_cash": 0, "holdings": []}
+            snapshot = {
+                "holdings": [],
+                "deposit_total": None,
+                "next_day_settlement_amount": None,
+                "provisional_settlement_amount": None,
+            }
         
         orders = self._get_recent_orders_safe()
         if self.show_orders and orders:
@@ -247,7 +265,13 @@ class SamsungTrader:
         
         logger.info("Token reuse source: %s", self.client.auth.token_source)
         logger.info("Current price: %s", current_price)
-        logger.info("Account snapshot: available_cash=%s holdings=%s", snapshot.get("available_cash"), snapshot.get("holdings"))
+        logger.info(
+            "Account snapshot: deposit_total=%s next_day_settlement_amount=%s provisional_settlement_amount=%s holdings=%s",
+            snapshot.get("deposit_total"),
+            snapshot.get("next_day_settlement_amount"),
+            snapshot.get("provisional_settlement_amount"),
+            snapshot.get("holdings"),
+        )
 
         if self.report:
             self._write_report(snapshot, current_price, orders)
@@ -281,11 +305,12 @@ class SamsungTrader:
                 order_price_sell,
                 get_tick_size(raw_sell_price),
             )
-        quantity = self._determine_quantity(before_snapshot["available_cash"], order_price_buy)
-
         if self.buy_only:
+            buying_power = self._get_buying_power_safe(config.symbol, order_price_buy)
+            before_snapshot.update(buying_power)
+            quantity = self._determine_quantity(buying_power.get("buying_power_quantity"))
             if quantity <= 0:
-                logger.info("Buy-only mode: not enough available cash to place a buy order at %s KRW.", order_price_buy)
+                logger.info("Buy-only mode: no buying power available for a buy order at %s KRW.", order_price_buy)
             elif self.dry_run:
                 logger.info("DRY_RUN enabled, skipping buy-only order. buy_price=%s qty=%s", order_price_buy, quantity)
             else:
@@ -302,8 +327,11 @@ class SamsungTrader:
             else:
                 self.order_service.place_sell_order(config.symbol, self.requested_quantity, order_price_sell)
         else:
+            buying_power = self._get_buying_power_safe(config.symbol, order_price_buy)
+            before_snapshot.update(buying_power)
+            quantity = self._determine_quantity(buying_power.get("buying_power_quantity"))
             if quantity <= 0:
-                logger.info("Not enough available cash to place a buy order at %s KRW.", order_price_buy)
+                logger.info("No buying power available for a buy order at %s KRW.", order_price_buy)
             elif self.dry_run:
                 logger.info("DRY_RUN enabled, skipping buy order. buy_price=%s qty=%s", order_price_buy, quantity)
             else:
@@ -337,6 +365,9 @@ class SamsungTrader:
         logger.info("Holdings after order: %s", after_snapshot["holdings"])
         execution_happened = self._record_execution(before_snapshot, after_snapshot)
         logger.info("Execution observed from snapshots: %s", execution_happened)
+
+    def _format_optional_amount(self, value: Any) -> str:
+        return str(value) if value is not None else "unavailable"
 
     def run_cycle(self, once: bool = False) -> None:
         logger.info(

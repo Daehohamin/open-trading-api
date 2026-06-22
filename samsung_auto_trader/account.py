@@ -12,7 +12,9 @@ class AccountService:
         logger.info("Requesting account balance and holdings.")
         payload = self.client.get_balance()
         holdings = []
-        available_cash = 0
+        deposit_total = None
+        next_day_settlement_amount = None
+        provisional_settlement_amount = None
 
         output1 = payload.get("output1")
         if isinstance(output1, dict):
@@ -30,21 +32,30 @@ class AccountService:
             output2 = output2[0]
 
         if isinstance(output2, dict):
-            available_cash = int(output2.get("ord_psbl_cash", 0) or 0)
-            if available_cash == 0:
-                available_cash = int(output2.get("dnca_tot_amt", 0) or 0)
-            if available_cash == 0:
-                available_cash = int(output2.get("prvs_rcdl_excc_amt", 0) or 0)
-        elif isinstance(payload.get("output"), dict):
-            available_cash = int(payload["output"].get("ord_psbl_cash", 0) or 0)
-        elif isinstance(payload.get("output"), list) and payload["output"]:
-            available_cash = int(payload["output"][0].get("ord_psbl_cash", 0) or 0)
+            deposit_total = self._parse_int(output2.get("dnca_tot_amt"))
+            next_day_settlement_amount = self._parse_int(output2.get("nxdy_excc_amt"))
+            provisional_settlement_amount = self._parse_int(output2.get("prvs_rcdl_excc_amt"))
 
-        if available_cash == 0 and isinstance(payload.get("output1"), list) and payload["output1"]:
-            available_cash = int(payload["output1"][0].get("ord_psbl_cash", 0) or 0)
+        logger.info(
+            "Account settlement amounts: deposit_total=%s next_day_settlement_amount=%s provisional_settlement_amount=%s",
+            deposit_total,
+            next_day_settlement_amount,
+            provisional_settlement_amount,
+        )
+        return {
+            "holdings": holdings,
+            "deposit_total": deposit_total,
+            "next_day_settlement_amount": next_day_settlement_amount,
+            "provisional_settlement_amount": provisional_settlement_amount,
+        }
 
-        logger.info("Account available cash: %s", available_cash)
-        return {"holdings": holdings, "available_cash": available_cash}
+    def _parse_int(self, value: Any) -> int | None:
+        if value in (None, ""):
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
 
     def find_holding(self, holdings: list[dict[str, Any]], symbol: str) -> dict[str, Any] | None:
         for item in holdings:

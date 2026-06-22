@@ -17,10 +17,12 @@ from samsung_auto_trader.kis_rate_limit import reset_kis_rate_limiter
 
 
 class DummyClient(KISClient):
-    def __init__(self, balance_payload=None, price_payload=None, orders_payload=None):
+    def __init__(self, balance_payload=None, price_payload=None, orders_payload=None, buying_power_payload=None):
         self.balance_payload = balance_payload or {}
         self.price_payload = price_payload or {}
         self.orders_payload = orders_payload or {}
+        self.buying_power_payload = buying_power_payload or {"buying_power_amount": 0, "buying_power_quantity": 0}
+        self.buying_power_calls: list[tuple[str, int]] = []
         self.auth = self
         self.token_source = "test"
 
@@ -32,6 +34,10 @@ class DummyClient(KISClient):
 
     def get_recent_daily_orders(self, days: int = 1):
         return self.orders_payload
+
+    def get_buying_power(self, symbol: str, order_price: int):
+        self.buying_power_calls.append((symbol, order_price))
+        return self.buying_power_payload
 
     def authenticate(self) -> str:
         return "test-token"
@@ -52,29 +58,45 @@ class DummyClientAllFailure(KISClient):
     def get_recent_daily_orders(self, days: int = 1):
         raise requests.HTTPError("500 Server Error: Internal Server Error for inquire-daily-ccld")
 
+    def get_buying_power(self, symbol: str, order_price: int):
+        raise requests.HTTPError("500 Server Error: Internal Server Error for inquire-psbl-order")
+
     def authenticate(self) -> str:
         return "test-token"
 
 
 class TestAccountService(unittest.TestCase):
-    def test_account_snapshot_uses_output1_holdings_and_output2_cash(self):
+    def test_account_snapshot_parses_output1_holdings_and_output2_settlement_fields(self):
         payload = {
             "output1": [{"pdno": "005930", "hldg_qty": "5"}],
-            "output2": {"ord_psbl_cash": "100000", "dnca_tot_amt": "50000", "prvs_rcdl_excc_amt": "20000"},
+            "output2": {
+                "ord_psbl_cash": "100000",
+                "dnca_tot_amt": "30000000",
+                "nxdy_excc_amt": "50000",
+                "prvs_rcdl_excc_amt": "20000",
+            },
         }
         account_service = AccountService(DummyClient(balance_payload=payload))
         snapshot = account_service.get_account_snapshot()
         self.assertEqual(snapshot["holdings"], payload["output1"])
-        self.assertEqual(snapshot["available_cash"], 100000)
+        self.assertEqual(snapshot["deposit_total"], 30000000)
+        self.assertEqual(snapshot["next_day_settlement_amount"], 50000)
+        self.assertEqual(snapshot["provisional_settlement_amount"], 20000)
+        self.assertNotIn("available_cash", snapshot)
+        self.assertNotIn("buying_power_amount", snapshot)
 
-    def test_account_snapshot_falls_back_to_dnca_tot_amt_and_prvs_rcdl_excc_amt(self):
+    def test_account_snapshot_does_not_use_settlement_fields_as_buying_power(self):
         payload = {
             "output1": [{"pdno": "005930", "hldg_qty": "5"}],
-            "output2": {"ord_psbl_cash": "0", "dnca_tot_amt": "50000", "prvs_rcdl_excc_amt": "20000"},
+            "output2": {"dnca_tot_amt": "30000000", "nxdy_excc_amt": "50000", "prvs_rcdl_excc_amt": "20000"},
         }
         account_service = AccountService(DummyClient(balance_payload=payload))
         snapshot = account_service.get_account_snapshot()
-        self.assertEqual(snapshot["available_cash"], 50000)
+        self.assertEqual(snapshot["deposit_total"], 30000000)
+        self.assertEqual(snapshot["next_day_settlement_amount"], 50000)
+        self.assertEqual(snapshot["provisional_settlement_amount"], 20000)
+        self.assertNotIn("buying_power_amount", snapshot)
+        self.assertNotIn("buying_power_quantity", snapshot)
 
 
 class FakeOrderService(OrderService):
@@ -141,7 +163,11 @@ class TestSamsungTrader(unittest.TestCase):
             "output2": {"ord_psbl_cash": "90000"},
         }
         price_payload = {"output": {"stck_prpr": "90000"}}
-        dummy_client = DummyClient(balance_payload=payload, price_payload=price_payload)
+        dummy_client = DummyClient(
+            balance_payload=payload,
+            price_payload=price_payload,
+            buying_power_payload={"buying_power_amount": 1000000, "buying_power_quantity": 3},
+        )
         fake_order_service = FakeOrderService()
         trader = SamsungTrader(
             dry_run=True,
@@ -150,7 +176,7 @@ class TestSamsungTrader(unittest.TestCase):
             client=dummy_client,
             order_service=fake_order_service,
         )
-        quantity = trader._determine_quantity(90000, 90000)
+        quantity = trader._determine_quantity(1)
         self.assertEqual(quantity, 1)
         self.assertLessEqual(quantity, 10)
 
@@ -160,7 +186,11 @@ class TestSamsungTrader(unittest.TestCase):
             "output2": {"ord_psbl_cash": "100000"},
         }
         price_payload = {"output": {"stck_prpr": "100000"}}
-        dummy_client = DummyClient(balance_payload=payload, price_payload=price_payload)
+        dummy_client = DummyClient(
+            balance_payload=payload,
+            price_payload=price_payload,
+            buying_power_payload={"buying_power_amount": 1000000, "buying_power_quantity": 3},
+        )
         trader = SamsungTrader(
             dry_run=True,
             paper_trading=True,
@@ -178,7 +208,11 @@ class TestSamsungTrader(unittest.TestCase):
             "output2": {"ord_psbl_cash": "1000000"},
         }
         price_payload = {"output": {"stck_prpr": "100000"}}
-        dummy_client = DummyClient(balance_payload=payload, price_payload=price_payload)
+        dummy_client = DummyClient(
+            balance_payload=payload,
+            price_payload=price_payload,
+            buying_power_payload={"buying_power_amount": 1000000, "buying_power_quantity": 3},
+        )
         fake_order_service = FakeOrderService()
         trader = SamsungTrader(
             dry_run=False,
@@ -192,6 +226,7 @@ class TestSamsungTrader(unittest.TestCase):
             trader._run_trade_cycle()
         self.assertEqual(fake_order_service.buy_calls, 1)
         self.assertEqual(fake_order_service.sell_calls, 0)
+        self.assertEqual(dummy_client.buying_power_calls, [("005930", 98000)])
 
     def test_buy_only_passes_normalized_price_to_order_service(self):
         payload = {
@@ -199,7 +234,11 @@ class TestSamsungTrader(unittest.TestCase):
             "output2": {"ord_psbl_cash": "1000000"},
         }
         price_payload = {"output": {"stck_prpr": "353250"}}
-        dummy_client = DummyClient(balance_payload=payload, price_payload=price_payload)
+        dummy_client = DummyClient(
+            balance_payload=payload,
+            price_payload=price_payload,
+            buying_power_payload={"buying_power_amount": 1000000, "buying_power_quantity": 1},
+        )
         fake_order_service = FakeOrderService()
         trader = SamsungTrader(
             offset=2000,
@@ -214,6 +253,7 @@ class TestSamsungTrader(unittest.TestCase):
             trader._run_trade_cycle()
         self.assertEqual(fake_order_service.buy_orders, [("005930", 1, 351000)])
         self.assertEqual(fake_order_service.sell_calls, 0)
+        self.assertEqual(dummy_client.buying_power_calls, [("005930", 351000)])
 
     def test_sell_only_submits_sell_order_when_holdings_sufficient(self):
         payload = {
@@ -235,6 +275,7 @@ class TestSamsungTrader(unittest.TestCase):
             trader._run_trade_cycle()
         self.assertEqual(fake_order_service.sell_calls, 1)
         self.assertEqual(fake_order_service.buy_calls, 0)
+        self.assertEqual(dummy_client.buying_power_calls, [])
 
     def test_sell_only_passes_normalized_price_to_order_service(self):
         payload = {
@@ -257,6 +298,7 @@ class TestSamsungTrader(unittest.TestCase):
             trader._run_trade_cycle()
         self.assertEqual(fake_order_service.sell_orders, [("005930", 1, 355500)])
         self.assertEqual(fake_order_service.buy_calls, 0)
+        self.assertEqual(dummy_client.buying_power_calls, [])
 
     def test_trade_cycle_price_normalization_tests_use_no_external_requests(self):
         payload = {
@@ -264,7 +306,11 @@ class TestSamsungTrader(unittest.TestCase):
             "output2": {"ord_psbl_cash": "1000000"},
         }
         price_payload = {"output": {"stck_prpr": "353250"}}
-        dummy_client = DummyClient(balance_payload=payload, price_payload=price_payload)
+        dummy_client = DummyClient(
+            balance_payload=payload,
+            price_payload=price_payload,
+            buying_power_payload={"buying_power_amount": 1000000, "buying_power_quantity": 1},
+        )
         fake_order_service = FakeOrderService()
         trader = SamsungTrader(
             offset=2000,
@@ -282,6 +328,7 @@ class TestSamsungTrader(unittest.TestCase):
         get.assert_not_called()
         post.assert_not_called()
         self.assertEqual(fake_order_service.buy_orders, [("005930", 1, 351000)])
+        self.assertEqual(dummy_client.buying_power_calls, [("005930", 351000)])
 
     def test_sell_only_submits_nothing_when_holdings_insufficient(self):
         payload = {
@@ -303,6 +350,7 @@ class TestSamsungTrader(unittest.TestCase):
             trader._run_trade_cycle()
         self.assertEqual(fake_order_service.sell_calls, 0)
         self.assertEqual(fake_order_service.buy_calls, 0)
+        self.assertEqual(dummy_client.buying_power_calls, [])
 
     def test_dry_run_submits_no_orders(self):
         payload = {
@@ -310,7 +358,11 @@ class TestSamsungTrader(unittest.TestCase):
             "output2": {"ord_psbl_cash": "1000000"},
         }
         price_payload = {"output": {"stck_prpr": "100000"}}
-        dummy_client = DummyClient(balance_payload=payload, price_payload=price_payload)
+        dummy_client = DummyClient(
+            balance_payload=payload,
+            price_payload=price_payload,
+            buying_power_payload={"buying_power_amount": 1000000, "buying_power_quantity": 1},
+        )
         fake_order_service = FakeOrderService()
         trader = SamsungTrader(
             dry_run=True,
@@ -321,6 +373,58 @@ class TestSamsungTrader(unittest.TestCase):
         )
         with patch("samsung_auto_trader.trader.time.sleep", return_value=None):
             trader._run_trade_cycle()
+        self.assertEqual(fake_order_service.buy_calls, 0)
+        self.assertEqual(fake_order_service.sell_calls, 0)
+        self.assertEqual(dummy_client.buying_power_calls, [("005930", 98000)])
+
+    def test_buy_quantity_is_capped_by_buying_power_quantity(self):
+        payload = {
+            "output1": [{"pdno": "005930", "hldg_qty": "0"}],
+            "output2": {"dnca_tot_amt": "30000000"},
+        }
+        price_payload = {"output": {"stck_prpr": "100000"}}
+        dummy_client = DummyClient(
+            balance_payload=payload,
+            price_payload=price_payload,
+            buying_power_payload={"buying_power_amount": 300000, "buying_power_quantity": 2},
+        )
+        fake_order_service = FakeOrderService()
+        trader = SamsungTrader(
+            dry_run=False,
+            paper_trading=True,
+            quantity=10,
+            buy_only=True,
+            client=dummy_client,
+            order_service=fake_order_service,
+        )
+        with patch("samsung_auto_trader.trader.time.sleep", return_value=None):
+            trader._run_trade_cycle()
+        self.assertEqual(fake_order_service.buy_orders, [("005930", 2, 98000)])
+
+    def test_buying_power_unavailable_uses_no_balance_fallback(self):
+        class BuyingPowerFailureClient(DummyClient):
+            def get_buying_power(self, symbol: str, order_price: int):
+                self.buying_power_calls.append((symbol, order_price))
+                raise requests.HTTPError("inquire-psbl-order failed")
+
+        payload = {
+            "output1": [{"pdno": "005930", "hldg_qty": "0"}],
+            "output2": {"dnca_tot_amt": "30000000", "nxdy_excc_amt": "30000000", "prvs_rcdl_excc_amt": "30000000"},
+        }
+        price_payload = {"output": {"stck_prpr": "100000"}}
+        dummy_client = BuyingPowerFailureClient(balance_payload=payload, price_payload=price_payload)
+        fake_order_service = FakeOrderService()
+        trader = SamsungTrader(
+            dry_run=False,
+            paper_trading=True,
+            quantity=1,
+            buy_only=True,
+            client=dummy_client,
+            order_service=fake_order_service,
+        )
+        with patch("samsung_auto_trader.trader.time.sleep", return_value=None):
+            trader._run_trade_cycle()
+        self.assertEqual(dummy_client.buying_power_calls, [("005930", 98000)])
         self.assertEqual(fake_order_service.buy_calls, 0)
         self.assertEqual(fake_order_service.sell_calls, 0)
 
@@ -361,7 +465,12 @@ class TestSamsungTrader(unittest.TestCase):
                 self.assertTrue(report_path.exists())
                 report_content = report_path.read_text()
                 self.assertIn("최근 주문내역 조회 불가", report_content)
-                self.assertIn("Available cash: 0", report_content)
+                self.assertIn("Deposit total: unavailable", report_content)
+                self.assertIn("Buying power: not queried", report_content)
+                self.assertNotIn("Available " + "cash", report_content)
+                summary_content = (Path(temp_outputs) / "account_summary.svg").read_text()
+                self.assertIn("Deposit total", summary_content)
+                self.assertNotIn("Available " + "cash", summary_content)
                 orders_csv = Path(temp_outputs) / "recent_orders.csv"
                 self.assertTrue(orders_csv.exists())
             finally:
@@ -497,6 +606,32 @@ class TestKISClient(unittest.TestCase):
             },
         )
         self.assertEqual(post.call_count, 1)
+
+    def test_get_buying_power_uses_inquire_psbl_order_and_parses_output(self):
+        client = self._client_without_auth()
+        response = FakeResponse(
+            payload={"rt_cd": "0", "output": {"nrcvb_buy_amt": "123000", "nrcvb_buy_qty": "3"}},
+        )
+        with patch.dict(os.environ, {"KIS_MIN_REQUEST_INTERVAL_SECONDS": "0"}, clear=False):
+            with patch("samsung_auto_trader.api_client.requests.get", return_value=response) as get:
+                buying_power = client.get_buying_power("005930", 70000)
+
+        self.assertEqual(buying_power, {"buying_power_amount": 123000, "buying_power_quantity": 3})
+        self.assertEqual(get.call_count, 1)
+        self.assertTrue(get.call_args.args[0].endswith("/uapi/domestic-stock/v1/trading/inquire-psbl-order"))
+        self.assertEqual(
+            get.call_args.kwargs["params"],
+            {
+                "CANO": app_config.gh_account,
+                "ACNT_PRDT_CD": app_config.gh_product_code,
+                "PDNO": "005930",
+                "ORD_UNPR": "70000",
+                "ORD_DVSN": "00",
+                "CMA_EVLU_AMT_ICLD_YN": "N",
+                "OVRS_ICLD_YN": "N",
+            },
+        )
+        self.assertEqual(get.call_args.kwargs["headers"]["tr_id"], "VTTC8908R")
 
     def test_place_order_http_500_error_is_sanitized(self):
         client = self._client_without_auth()

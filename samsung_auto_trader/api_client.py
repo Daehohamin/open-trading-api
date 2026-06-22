@@ -115,6 +115,39 @@ class KISClient:
         )
         return payload
 
+    def get_buying_power(self, symbol: str, order_price: int) -> dict[str, int]:
+        path = "/uapi/domestic-stock/v1/trading/inquire-psbl-order"
+        params = {
+            "CANO": config.gh_account,
+            "ACNT_PRDT_CD": config.gh_product_code,
+            "PDNO": symbol,
+            "ORD_UNPR": str(order_price),
+            "ORD_DVSN": "00",
+            "CMA_EVLU_AMT_ICLD_YN": "N",
+            "OVRS_ICLD_YN": "N",
+        }
+        payload = self._request(
+            "GET",
+            path,
+            params=params,
+            extra_headers={"tr_id": "VTTC8908R"},
+        )
+        output = payload.get("output") or {}
+        if isinstance(output, list):
+            output = output[0] if output else {}
+        return {
+            "buying_power_amount": self._parse_int(output.get("nrcvb_buy_amt")),
+            "buying_power_quantity": self._parse_int(output.get("nrcvb_buy_qty")),
+        }
+
+    def _parse_int(self, value: Any) -> int:
+        if value in (None, ""):
+            return 0
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
     def get_recent_daily_orders(self, days: int = 1) -> dict[str, Any]:
         from datetime import date, timedelta
 
