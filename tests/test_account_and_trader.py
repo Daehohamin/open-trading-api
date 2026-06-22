@@ -9,6 +9,7 @@ import requests
 
 from samsung_auto_trader.account import AccountService
 from samsung_auto_trader.orders import OrderService
+from samsung_auto_trader.price_utils import get_tick_size, normalize_order_price
 from samsung_auto_trader.trader import SamsungTrader
 from samsung_auto_trader.api_client import KISClient
 from samsung_auto_trader.config import config as app_config
@@ -81,14 +82,56 @@ class FakeOrderService(OrderService):
         super().__init__(client=DummyClient(), paper_trading=True)
         self.buy_calls = 0
         self.sell_calls = 0
+        self.buy_orders: list[tuple[str, int, int]] = []
+        self.sell_orders: list[tuple[str, int, int]] = []
 
     def place_buy_order(self, symbol: str, quantity: int, price: int) -> dict[str, Any]:
         self.buy_calls += 1
+        self.buy_orders.append((symbol, quantity, price))
         return {"result": "buy_called"}
 
     def place_sell_order(self, symbol: str, quantity: int, price: int) -> dict[str, Any]:
         self.sell_calls += 1
+        self.sell_orders.append((symbol, quantity, price))
         return {"result": "sell_called"}
+
+
+class TestPriceUtils(unittest.TestCase):
+    def test_tick_size_boundaries(self):
+        cases = [
+            (1, 1),
+            (1_999, 1),
+            (2_000, 5),
+            (4_999, 5),
+            (5_000, 10),
+            (19_999, 10),
+            (20_000, 50),
+            (49_999, 50),
+            (50_000, 100),
+            (199_999, 100),
+            (200_000, 500),
+            (499_999, 500),
+            (500_000, 1_000),
+        ]
+        for price, expected_tick in cases:
+            with self.subTest(price=price):
+                self.assertEqual(get_tick_size(price), expected_tick)
+
+    def test_normalize_buy_rounds_down_to_tick(self):
+        self.assertEqual(normalize_order_price(351_250, "buy"), 351_000)
+
+    def test_normalize_sell_rounds_up_to_tick(self):
+        self.assertEqual(normalize_order_price(355_250, "sell"), 355_500)
+
+    def test_valid_price_remains_unchanged(self):
+        self.assertEqual(normalize_order_price(353_500, "buy"), 353_500)
+        self.assertEqual(normalize_order_price(353_500, "sell"), 353_500)
+
+    def test_zero_or_negative_prices_are_rejected(self):
+        for price in [0, -1]:
+            with self.subTest(price=price):
+                with self.assertRaises(ValueError):
+                    normalize_order_price(price, "buy")
 
 
 class TestSamsungTrader(unittest.TestCase):
@@ -150,6 +193,28 @@ class TestSamsungTrader(unittest.TestCase):
         self.assertEqual(fake_order_service.buy_calls, 1)
         self.assertEqual(fake_order_service.sell_calls, 0)
 
+    def test_buy_only_passes_normalized_price_to_order_service(self):
+        payload = {
+            "output1": [{"pdno": "005930", "hldg_qty": "10"}],
+            "output2": {"ord_psbl_cash": "1000000"},
+        }
+        price_payload = {"output": {"stck_prpr": "353250"}}
+        dummy_client = DummyClient(balance_payload=payload, price_payload=price_payload)
+        fake_order_service = FakeOrderService()
+        trader = SamsungTrader(
+            offset=2000,
+            dry_run=False,
+            paper_trading=True,
+            quantity=1,
+            buy_only=True,
+            client=dummy_client,
+            order_service=fake_order_service,
+        )
+        with patch("samsung_auto_trader.trader.time.sleep", return_value=None):
+            trader._run_trade_cycle()
+        self.assertEqual(fake_order_service.buy_orders, [("005930", 1, 351000)])
+        self.assertEqual(fake_order_service.sell_calls, 0)
+
     def test_sell_only_submits_sell_order_when_holdings_sufficient(self):
         payload = {
             "output1": [{"pdno": "005930", "hldg_qty": "10"}],
@@ -170,6 +235,53 @@ class TestSamsungTrader(unittest.TestCase):
             trader._run_trade_cycle()
         self.assertEqual(fake_order_service.sell_calls, 1)
         self.assertEqual(fake_order_service.buy_calls, 0)
+
+    def test_sell_only_passes_normalized_price_to_order_service(self):
+        payload = {
+            "output1": [{"pdno": "005930", "hldg_qty": "10"}],
+            "output2": {"ord_psbl_cash": "100000"},
+        }
+        price_payload = {"output": {"stck_prpr": "353250"}}
+        dummy_client = DummyClient(balance_payload=payload, price_payload=price_payload)
+        fake_order_service = FakeOrderService()
+        trader = SamsungTrader(
+            offset=2000,
+            dry_run=False,
+            paper_trading=True,
+            quantity=1,
+            sell_only=True,
+            client=dummy_client,
+            order_service=fake_order_service,
+        )
+        with patch("samsung_auto_trader.trader.time.sleep", return_value=None):
+            trader._run_trade_cycle()
+        self.assertEqual(fake_order_service.sell_orders, [("005930", 1, 355500)])
+        self.assertEqual(fake_order_service.buy_calls, 0)
+
+    def test_trade_cycle_price_normalization_tests_use_no_external_requests(self):
+        payload = {
+            "output1": [{"pdno": "005930", "hldg_qty": "10"}],
+            "output2": {"ord_psbl_cash": "1000000"},
+        }
+        price_payload = {"output": {"stck_prpr": "353250"}}
+        dummy_client = DummyClient(balance_payload=payload, price_payload=price_payload)
+        fake_order_service = FakeOrderService()
+        trader = SamsungTrader(
+            offset=2000,
+            dry_run=False,
+            paper_trading=True,
+            quantity=1,
+            buy_only=True,
+            client=dummy_client,
+            order_service=fake_order_service,
+        )
+        with patch("samsung_auto_trader.trader.time.sleep", return_value=None):
+            with patch("samsung_auto_trader.api_client.requests.get") as get:
+                with patch("samsung_auto_trader.api_client.requests.post") as post:
+                    trader._run_trade_cycle()
+        get.assert_not_called()
+        post.assert_not_called()
+        self.assertEqual(fake_order_service.buy_orders, [("005930", 1, 351000)])
 
     def test_sell_only_submits_nothing_when_holdings_insufficient(self):
         payload = {

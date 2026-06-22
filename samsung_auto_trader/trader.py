@@ -13,6 +13,7 @@ from samsung_auto_trader.config import config
 from samsung_auto_trader.logger import logger
 from samsung_auto_trader.market_data import MarketDataService
 from samsung_auto_trader.orders import OrderService
+from samsung_auto_trader.price_utils import get_tick_size, normalize_order_price
 
 
 class SamsungTrader:
@@ -262,8 +263,24 @@ class SamsungTrader:
         samsung_qty = self._holding_quantity(holding)
         logger.info("Current Samsung holdings qty: %s", samsung_qty)
 
-        order_price_buy = current_price - self.offset
-        order_price_sell = current_price + self.offset
+        raw_buy_price = current_price - self.offset
+        raw_sell_price = current_price + self.offset
+        order_price_buy = normalize_order_price(raw_buy_price, "buy")
+        order_price_sell = normalize_order_price(raw_sell_price, "sell")
+        if order_price_buy != raw_buy_price:
+            logger.info(
+                "Order price adjusted to KRX tick: side=buy raw=%s normalized=%s tick=%s",
+                raw_buy_price,
+                order_price_buy,
+                get_tick_size(raw_buy_price),
+            )
+        if order_price_sell != raw_sell_price:
+            logger.info(
+                "Order price adjusted to KRX tick: side=sell raw=%s normalized=%s tick=%s",
+                raw_sell_price,
+                order_price_sell,
+                get_tick_size(raw_sell_price),
+            )
         quantity = self._determine_quantity(before_snapshot["available_cash"], order_price_buy)
 
         if self.buy_only:
