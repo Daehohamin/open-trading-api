@@ -12,6 +12,7 @@ from samsung_auto_trader.orders import OrderService
 from samsung_auto_trader.trader import SamsungTrader
 from samsung_auto_trader.api_client import KISClient
 from samsung_auto_trader.config import config as app_config
+from samsung_auto_trader.kis_rate_limit import reset_kis_rate_limiter
 
 
 class DummyClient(KISClient):
@@ -212,14 +213,14 @@ class TestSamsungTrader(unittest.TestCase):
         self.assertEqual(fake_order_service.sell_calls, 0)
 
     def test_trading_window_timezone(self):
-        trader = SamsungTrader(dry_run=True, paper_trading=True, quantity=1)
+        trader = SamsungTrader(dry_run=True, paper_trading=True, quantity=1, client=DummyClient())
         now = trader._now()
         start_time = datetime.strptime("09:10", "%H:%M").time()
         end_time = datetime.strptime("15:30", "%H:%M").time()
         self.assertEqual(trader._is_within_trading_window(), now.weekday() < 5 and start_time <= now.time() <= end_time)
 
     def test_sunday_morning_is_outside_trading_window(self):
-        trader = SamsungTrader(dry_run=True, paper_trading=True, quantity=1)
+        trader = SamsungTrader(dry_run=True, paper_trading=True, quantity=1, client=DummyClient())
         sunday_morning = datetime(2026, 6, 21, 10, 0, tzinfo=ZoneInfo("Asia/Seoul"))
         with patch.object(trader, "_now", return_value=sunday_morning):
             self.assertFalse(trader._is_within_trading_window())
@@ -304,36 +305,146 @@ class TestSamsungTrader(unittest.TestCase):
 
 
 class FakeResponse:
+    def __init__(self, status_code: int = 200, payload: dict[str, Any] | None = None):
+        self.status_code = status_code
+        self.payload = payload if payload is not None else {"rt_cd": "0"}
+
     def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"HTTP {self.status_code}")
         return None
 
-    def json(self) -> dict[str, str]:
-        return {"rt_cd": "0"}
+    def json(self) -> dict[str, Any]:
+        return self.payload
 
 
 class TestKISClient(unittest.TestCase):
+    def setUp(self) -> None:
+        reset_kis_rate_limiter()
+
     def _client_without_auth(self) -> KISClient:
         client = KISClient.__new__(KISClient)
         client.token = "test-token"
         return client
 
-    def test_buy_order_payload_contains_exchange_code(self):
+    def test_request_throttling(self):
         client = self._client_without_auth()
-        with patch("samsung_auto_trader.api_client.requests.post", return_value=FakeResponse()) as post:
-            client.place_order("buy", "005930", 1, 70000)
+        with patch.dict(os.environ, {"KIS_MIN_REQUEST_INTERVAL_SECONDS": "1.2"}, clear=False):
+            with patch("samsung_auto_trader.kis_rate_limit.time.monotonic", side_effect=[100.0, 100.5, 101.2]):
+                with patch("samsung_auto_trader.kis_rate_limit.time.sleep") as sleep:
+                    with patch("samsung_auto_trader.api_client.requests.get", return_value=FakeResponse()) as get:
+                        client._request("GET", "/first")
+                        client._request("GET", "/second")
+
+        self.assertEqual(get.call_count, 2)
+        sleep.assert_called_once()
+        self.assertAlmostEqual(sleep.call_args.args[0], 0.7)
+
+    def test_buy_order_payload_matches_official_cash_order_shape(self):
+        client = self._client_without_auth()
+        with patch.dict(os.environ, {"KIS_MIN_REQUEST_INTERVAL_SECONDS": "0"}, clear=False):
+            with patch("samsung_auto_trader.api_client.requests.post", return_value=FakeResponse()) as post:
+                client.place_order("buy", "005930", 1, 70000)
 
         payload = post.call_args.kwargs["json"]
-        self.assertEqual(payload["EXCG_ID_DVSN_CD"], "KRX")
-        self.assertNotIn("SLL_TYPE", payload)
+        self.assertEqual(
+            payload,
+            {
+                "CANO": app_config.gh_account,
+                "ACNT_PRDT_CD": app_config.gh_product_code,
+                "PDNO": "005930",
+                "ORD_DVSN": "00",
+                "ORD_QTY": "1",
+                "ORD_UNPR": "70000",
+                "EXCG_ID_DVSN_CD": "KRX",
+                "SLL_TYPE": "",
+                "CNDT_PRIC": "",
+            },
+        )
+        self.assertEqual(post.call_count, 1)
 
-    def test_sell_order_payload_contains_exchange_code_and_sell_type(self):
+    def test_sell_order_payload_matches_official_cash_order_shape(self):
         client = self._client_without_auth()
-        with patch("samsung_auto_trader.api_client.requests.post", return_value=FakeResponse()) as post:
-            client.place_order("sell", "005930", 1, 70000)
+        with patch.dict(os.environ, {"KIS_MIN_REQUEST_INTERVAL_SECONDS": "0"}, clear=False):
+            with patch("samsung_auto_trader.api_client.requests.post", return_value=FakeResponse()) as post:
+                client.place_order("sell", "005930", 1, 70000)
 
         payload = post.call_args.kwargs["json"]
-        self.assertEqual(payload["EXCG_ID_DVSN_CD"], "KRX")
-        self.assertEqual(payload["SLL_TYPE"], "01")
+        self.assertEqual(
+            payload,
+            {
+                "CANO": app_config.gh_account,
+                "ACNT_PRDT_CD": app_config.gh_product_code,
+                "PDNO": "005930",
+                "ORD_DVSN": "00",
+                "ORD_QTY": "1",
+                "ORD_UNPR": "70000",
+                "EXCG_ID_DVSN_CD": "KRX",
+                "SLL_TYPE": "01",
+                "CNDT_PRIC": "",
+            },
+        )
+        self.assertEqual(post.call_count, 1)
+
+    def test_place_order_http_500_error_is_sanitized(self):
+        client = self._client_without_auth()
+        response = FakeResponse(
+            status_code=500,
+            payload={"rt_cd": "1", "msg_cd": "EGW00201", "msg1": "Too many requests"},
+        )
+        env_updates = {
+            "GH_ACCOUNT": "CANO12345",
+            "GH_APPKEY": "APPKEY_SECRET",
+            "GH_APPSECRET": "APPSECRET_SECRET",
+            "KIS_MIN_REQUEST_INTERVAL_SECONDS": "0",
+        }
+        with patch.dict(os.environ, env_updates, clear=False):
+            with patch("samsung_auto_trader.api_client.requests.post", return_value=response) as post:
+                with self.assertLogs("samsung_auto_trader", level="ERROR") as captured:
+                    with self.assertRaises(requests.HTTPError) as raised:
+                        client.place_order("buy", "005930", 1, 70000)
+
+        combined = "\n".join(captured.output + [str(raised.exception)])
+        self.assertIn("status=500", combined)
+        self.assertIn("msg_cd=EGW00201", combined)
+        self.assertIn("msg1=Too many requests", combined)
+        self.assertNotIn("CANO12345", combined)
+        self.assertNotIn("APPKEY_SECRET", combined)
+        self.assertNotIn("APPSECRET_SECRET", combined)
+        self.assertNotIn("test-token", combined)
+        self.assertNotIn("http://", combined)
+        self.assertNotIn("https://", combined)
+        self.assertEqual(post.call_count, 1)
+
+    def test_place_order_nonzero_rt_cd_raises_sanitized_runtime_error(self):
+        client = self._client_without_auth()
+        response = FakeResponse(
+            status_code=200,
+            payload={"rt_cd": "1", "msg_cd": "ORD001", "msg1": "Rejected"},
+        )
+        with patch.dict(os.environ, {"KIS_MIN_REQUEST_INTERVAL_SECONDS": "0"}, clear=False):
+            with patch("samsung_auto_trader.api_client.requests.post", return_value=response) as post:
+                with self.assertRaises(RuntimeError) as raised:
+                    client.place_order("sell", "005930", 1, 70000)
+
+        message = str(raised.exception)
+        self.assertIn("rt_cd=1", message)
+        self.assertIn("msg_cd=ORD001", message)
+        self.assertIn("msg1=Rejected", message)
+        self.assertNotIn("http://", message)
+        self.assertNotIn("https://", message)
+        self.assertEqual(post.call_count, 1)
+
+    def test_kis_client_tests_do_not_make_external_requests(self):
+        client = self._client_without_auth()
+        with patch.dict(os.environ, {"KIS_MIN_REQUEST_INTERVAL_SECONDS": "0"}, clear=False):
+            with patch("samsung_auto_trader.api_client.requests.get", return_value=FakeResponse()) as get:
+                with patch("samsung_auto_trader.api_client.requests.post", return_value=FakeResponse()) as post:
+                    client._request("GET", "/mock-get")
+                    client.place_order("buy", "005930", 1, 70000)
+
+        self.assertEqual(get.call_count, 1)
+        self.assertEqual(post.call_count, 1)
 
 
 if __name__ == "__main__":

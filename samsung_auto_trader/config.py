@@ -21,6 +21,7 @@ class Config:
     order_timeout_seconds: int = 10
     retry_interval_seconds: int = 5
     max_retries: int = 2
+    default_min_request_interval_seconds: float = 1.2
 
     @property
     def gh_account(self) -> str:
@@ -37,6 +38,16 @@ class Config:
     @property
     def gh_product_code(self) -> str:
         return os.getenv("GH_PRODUCT_CODE", self.default_product_code).strip()
+
+    @property
+    def kis_min_request_interval_seconds(self) -> float:
+        raw_value = os.getenv("KIS_MIN_REQUEST_INTERVAL_SECONDS", "").strip()
+        if not raw_value:
+            return self.default_min_request_interval_seconds
+        try:
+            return max(0.0, float(raw_value))
+        except ValueError:
+            return self.default_min_request_interval_seconds
 
     @property
     def is_trading_window_enabled(self) -> bool:

@@ -7,6 +7,7 @@ from typing import Any
 from requests import RequestException, post
 
 from samsung_auto_trader.config import config
+from samsung_auto_trader.kis_rate_limit import throttle_kis_request
 from samsung_auto_trader.logger import logger
 
 
@@ -78,6 +79,7 @@ class KISAuth:
         }
 
         try:
+            throttle_kis_request()
             response = post(self.TOKEN_URL, json=payload, timeout=15, headers=headers)
             try:
                 response.raise_for_status()

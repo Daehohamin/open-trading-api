@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import time
 from typing import Any
 
 import requests
 
 from samsung_auto_trader.auth import KISAuth
 from samsung_auto_trader.config import config
+from samsung_auto_trader.kis_rate_limit import throttle_kis_request
 from samsung_auto_trader.logger import logger
 
 
@@ -42,8 +42,10 @@ class KISClient:
         for attempt in range(config.max_retries + 1):
             try:
                 if method == "GET":
+                    throttle_kis_request()
                     response = requests.get(url, headers=headers, params=params, timeout=config.order_timeout_seconds)
                 else:
+                    throttle_kis_request()
                     response = requests.post(url, headers=headers, json=data, timeout=config.order_timeout_seconds)
                 response.raise_for_status()
                 payload = response.json()
@@ -160,11 +162,32 @@ class KISClient:
             "ORD_QTY": str(quantity),
             "ORD_UNPR": str(price),
             "EXCG_ID_DVSN_CD": "KRX",
+            "SLL_TYPE": "" if action == "buy" else "01",
+            "CNDT_PRIC": "",
         }
-        if action == "sell":
-            data["SLL_TYPE"] = "01"
         headers = {"tr_id": tr_id, "custtype": "P", "tr_cont": ""}
         url = f"{self.BASE_URL}{path}"
+        throttle_kis_request()
         response = requests.post(url, headers={**self._get_headers(), **headers}, json=data, timeout=config.order_timeout_seconds)
-        response.raise_for_status()
-        return response.json()
+        status = getattr(response, "status_code", None)
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = {}
+
+        msg_cd = payload.get("msg_cd", "")
+        msg1 = payload.get("msg1", "")
+
+        if status != 200:
+            logger.error("Order request failed: status=%s msg_cd=%s msg1=%s", status, msg_cd, msg1)
+            raise requests.HTTPError(f"KIS order HTTP error: status={status} msg_cd={msg_cd} msg1={msg1}")
+
+        rt_cd = payload.get("rt_cd")
+        if rt_cd != "0":
+            logger.error("Order rejected: status=%s msg_cd=%s msg1=%s", status, msg_cd, msg1)
+            raise RuntimeError(f"KIS order rejected: rt_cd={rt_cd} msg_cd={msg_cd} msg1={msg1}")
+
+        output = payload.get("output") or {}
+        order_number = output.get("ODNO") or output.get("odno") or output.get("order_no") or ""
+        logger.info("Order accepted: rt_cd=%s order_number=%s", rt_cd, order_number)
+        return payload
