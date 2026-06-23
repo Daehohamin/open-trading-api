@@ -2,18 +2,31 @@ import argparse
 import csv
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from samsung_auto_trader.account import AccountService
-from samsung_auto_trader.api_client import KISClient
+from samsung_auto_trader.api_client import KISClient, OrderStatus
 from samsung_auto_trader.config import config
 from samsung_auto_trader.logger import logger
 from samsung_auto_trader.market_data import MarketDataService
 from samsung_auto_trader.orders import OrderService
 from samsung_auto_trader.price_utils import get_tick_size, normalize_order_price
+
+
+@dataclass
+class OrderWaitResult:
+    order_status: OrderStatus
+    timed_out: bool = False
+
+
+@dataclass
+class HoldingWaitResult:
+    quantity: int
+    timed_out: bool = False
 
 
 class SamsungTrader:
@@ -28,6 +41,9 @@ class SamsungTrader:
         show_orders: bool = False,
         report: bool = False,
         inspect: bool = False,
+        auto_cycle: bool = False,
+        order_status_timeout: float = 120.0,
+        order_status_poll_interval: float = 5.0,
         client: KISClient | None = None,
         market_data: MarketDataService | None = None,
         account_service: AccountService | None = None,
@@ -42,6 +58,9 @@ class SamsungTrader:
         self.show_orders = show_orders
         self.report = report
         self.inspect = inspect
+        self.auto_cycle = auto_cycle
+        self.order_status_timeout = order_status_timeout
+        self.order_status_poll_interval = order_status_poll_interval
 
         self.client = client if client is not None else KISClient()
         self.market_data = market_data if market_data is not None else MarketDataService(self.client)
@@ -225,6 +244,297 @@ class SamsungTrader:
         after_qty = self._holding_quantity(after_holding)
         return before_qty != after_qty
 
+    def _extract_order_number(self, payload: dict[str, Any]) -> str:
+        output = payload.get("output") or {}
+        if isinstance(output, list):
+            output = output[0] if output else {}
+        if not isinstance(output, dict):
+            return ""
+        return str(output.get("ODNO") or output.get("odno") or output.get("order_no") or "")
+
+    def _account_holding_quantity(self) -> int:
+        snapshot = self.account_service.get_account_snapshot()
+        holding = self.account_service.find_holding(snapshot.get("holdings", []), config.symbol) or {}
+        return self._holding_quantity(holding)
+
+    def wait_for_holding_quantity(
+        self,
+        expected_quantity: int,
+        timeout: float,
+        poll_interval: float,
+    ) -> HoldingWaitResult:
+        started_at = time.monotonic()
+        last_quantity: int | None = None
+
+        while True:
+            quantity = self._account_holding_quantity()
+            if quantity != last_quantity:
+                logger.info(
+                    "Holding quantity transition: symbol=%s quantity=%s expected=%s",
+                    config.symbol,
+                    quantity,
+                    expected_quantity,
+                )
+                last_quantity = quantity
+
+            if quantity == expected_quantity:
+                return HoldingWaitResult(quantity=quantity, timed_out=False)
+
+            elapsed = time.monotonic() - started_at
+            if elapsed >= timeout:
+                logger.warning(
+                    "Holding quantity confirmation timed out: symbol=%s quantity=%s expected=%s",
+                    config.symbol,
+                    quantity,
+                    expected_quantity,
+                )
+                return HoldingWaitResult(quantity=quantity, timed_out=True)
+
+            time.sleep(poll_interval)
+
+    def _is_pending_order_row(self, row: dict[str, Any], symbol: str) -> bool:
+        status = self.client._parse_order_status(row)
+        return status.symbol.zfill(6) == symbol and status.status in ("PENDING", "PARTIALLY_FILLED")
+
+    def _has_existing_pending_order(self, orders: list[dict[str, Any]], symbol: str) -> bool:
+        for row in orders:
+            try:
+                if self._is_pending_order_row(row, symbol):
+                    return True
+            except Exception:
+                logger.warning("Could not parse recent order row while checking pending orders.")
+        return False
+
+    def wait_for_order_completion(
+        self,
+        order_number: str,
+        expected_quantity: int,
+        timeout_seconds: float,
+        poll_interval_seconds: float,
+    ) -> OrderWaitResult:
+        started_at = time.monotonic()
+        last_state: str | None = None
+        latest_status = OrderStatus(
+            order_number=order_number,
+            side="",
+            symbol="",
+            ordered_quantity=expected_quantity,
+            filled_quantity=0,
+            remaining_quantity=expected_quantity,
+            order_price=0,
+            average_fill_price=0,
+            rejected_quantity=0,
+            cancelled=False,
+            status="NOT_FOUND",
+        )
+
+        while True:
+            latest_status = self.client.get_order_status(order_number)
+            state = (
+                latest_status.status,
+                latest_status.filled_quantity,
+                latest_status.remaining_quantity,
+                latest_status.rejected_quantity,
+            )
+            state_text = str(state)
+            if state_text != last_state:
+                logger.info(
+                    "Order status transition: order_number=%s status=%s filled=%s remaining=%s rejected=%s",
+                    latest_status.order_number,
+                    latest_status.status,
+                    latest_status.filled_quantity,
+                    latest_status.remaining_quantity,
+                    latest_status.rejected_quantity,
+                )
+                last_state = state_text
+
+            if latest_status.status in ("FILLED", "REJECTED", "CANCELLED"):
+                return OrderWaitResult(order_status=latest_status, timed_out=False)
+
+            elapsed = time.monotonic() - started_at
+            if elapsed >= timeout_seconds:
+                logger.warning("Order status polling timed out: order_number=%s status=%s", order_number, latest_status.status)
+                return OrderWaitResult(order_status=latest_status, timed_out=True)
+
+            time.sleep(poll_interval_seconds)
+
+    def _log_auto_stopped(self, reason: str) -> None:
+        logger.info("AUTO_STATE=STOPPED reason=%s", reason)
+
+    def _run_auto_cycle_once(self) -> bool:
+        logger.info("AUTO_STATE=PRECHECK")
+        if not self._is_within_trading_window():
+            self._log_auto_stopped("trading_window_closed")
+            return False
+
+        before_snapshot = self.account_service.get_account_snapshot()
+        holding = self.account_service.find_holding(before_snapshot.get("holdings", []), config.symbol) or {}
+        baseline_quantity = self._holding_quantity(holding)
+        orders = self._get_recent_orders_safe()
+        if self._has_existing_pending_order(orders, config.symbol):
+            self._log_auto_stopped("existing_pending_order")
+            return False
+
+        current_price = self.market_data.get_current_price(config.symbol)
+        if current_price is None:
+            self._log_auto_stopped("price_unavailable")
+            return False
+        raw_buy_price = current_price - self.offset
+        buy_price = normalize_order_price(raw_buy_price, "buy")
+        if buy_price != raw_buy_price:
+            logger.info(
+                "Order price adjusted to KRX tick: side=buy raw=%s normalized=%s tick=%s",
+                raw_buy_price,
+                buy_price,
+                get_tick_size(raw_buy_price),
+            )
+        buying_power = self._get_buying_power_safe(config.symbol, buy_price)
+        quantity = self._determine_quantity(buying_power.get("buying_power_quantity"))
+        if quantity <= 0:
+            self._log_auto_stopped("buying_power_unavailable")
+            return False
+        if self.dry_run:
+            logger.info("DRY_RUN enabled, skipping auto-cycle buy order. buy_price=%s qty=%s", buy_price, quantity)
+            self._log_auto_stopped("dry_run")
+            return False
+
+        buy_payload = self.order_service.place_buy_order(config.symbol, quantity, buy_price)
+        buy_order_number = self._extract_order_number(buy_payload)
+        if not buy_order_number:
+            self._log_auto_stopped("missing_buy_order_number")
+            return False
+        logger.info("AUTO_STATE=BUY_SUBMITTED order_number=%s qty=%s price=%s", buy_order_number, quantity, buy_price)
+        logger.info("AUTO_STATE=BUY_PENDING order_number=%s", buy_order_number)
+        buy_wait = self.wait_for_order_completion(
+            buy_order_number,
+            quantity,
+            self.order_status_timeout,
+            self.order_status_poll_interval,
+        )
+        buy_status = buy_wait.order_status
+        if buy_wait.timed_out:
+            self._log_auto_stopped("buy_timeout")
+            self._print_auto_summary(buy_status, None, baseline_quantity, self._account_holding_quantity())
+            return False
+        if buy_status.status != "FILLED":
+            self._log_auto_stopped(f"buy_{buy_status.status.lower()}")
+            self._print_auto_summary(buy_status, None, baseline_quantity, self._account_holding_quantity())
+            return False
+        logger.info("AUTO_STATE=BUY_FILLED order_number=%s", buy_order_number)
+
+        expected_after_buy = baseline_quantity + quantity
+        after_buy_wait = self.wait_for_holding_quantity(
+            expected_after_buy,
+            self.order_status_timeout,
+            self.order_status_poll_interval,
+        )
+        after_buy_quantity = after_buy_wait.quantity
+        if after_buy_wait.timed_out:
+            self._log_auto_stopped("buy_holding_not_confirmed")
+            self._print_auto_summary(buy_status, None, baseline_quantity, after_buy_quantity)
+            return False
+
+        latest_price = self.market_data.get_current_price(config.symbol)
+        if latest_price is None:
+            self._log_auto_stopped("sell_price_unavailable")
+            self._print_auto_summary(buy_status, None, baseline_quantity, after_buy_quantity)
+            return False
+        raw_sell_price = latest_price + self.offset
+        sell_price = normalize_order_price(raw_sell_price, "sell")
+        if sell_price != raw_sell_price:
+            logger.info(
+                "Order price adjusted to KRX tick: side=sell raw=%s normalized=%s tick=%s",
+                raw_sell_price,
+                sell_price,
+                get_tick_size(raw_sell_price),
+            )
+        sell_quantity = buy_status.filled_quantity or quantity
+        sell_payload = self.order_service.place_sell_order(config.symbol, sell_quantity, sell_price)
+        sell_order_number = self._extract_order_number(sell_payload)
+        if not sell_order_number:
+            self._log_auto_stopped("missing_sell_order_number")
+            self._print_auto_summary(buy_status, None, baseline_quantity, after_buy_quantity)
+            return False
+        logger.info("AUTO_STATE=SELL_SUBMITTED order_number=%s qty=%s price=%s", sell_order_number, sell_quantity, sell_price)
+        logger.info("AUTO_STATE=SELL_PENDING order_number=%s", sell_order_number)
+        sell_wait = self.wait_for_order_completion(
+            sell_order_number,
+            sell_quantity,
+            self.order_status_timeout,
+            self.order_status_poll_interval,
+        )
+        sell_status = sell_wait.order_status
+        if sell_wait.timed_out:
+            self._log_auto_stopped("sell_timeout")
+            self._print_auto_summary(buy_status, sell_status, baseline_quantity, self._account_holding_quantity())
+            return False
+        if sell_status.status != "FILLED":
+            self._log_auto_stopped(f"sell_{sell_status.status.lower()}")
+            self._print_auto_summary(buy_status, sell_status, baseline_quantity, self._account_holding_quantity())
+            return False
+        logger.info("AUTO_STATE=SELL_FILLED order_number=%s", sell_order_number)
+
+        final_wait = self.wait_for_holding_quantity(
+            baseline_quantity,
+            self.order_status_timeout,
+            self.order_status_poll_interval,
+        )
+        final_quantity = final_wait.quantity
+        if final_wait.timed_out:
+            self._log_auto_stopped("final_holding_not_confirmed")
+            self._print_auto_summary(buy_status, sell_status, baseline_quantity, final_quantity)
+            return False
+
+        logger.info("AUTO_STATE=COMPLETE")
+        self._print_auto_summary(buy_status, sell_status, baseline_quantity, final_quantity)
+        return True
+
+    def _print_auto_summary(
+        self,
+        buy_status: OrderStatus | None,
+        sell_status: OrderStatus | None,
+        starting_holdings: int,
+        final_holdings: int,
+    ) -> None:
+        logger.info(
+            "AUTO_SUMMARY buy_order_number=%s buy_fill_status=%s buy_filled_quantity=%s buy_average_fill_price=%s "
+            "sell_order_number=%s sell_fill_status=%s sell_filled_quantity=%s sell_average_fill_price=%s "
+            "starting_holdings=%s final_holdings=%s",
+            buy_status.order_number if buy_status else "",
+            buy_status.status if buy_status else "",
+            buy_status.filled_quantity if buy_status else 0,
+            buy_status.average_fill_price if buy_status else 0,
+            sell_status.order_number if sell_status else "",
+            sell_status.status if sell_status else "",
+            sell_status.filled_quantity if sell_status else 0,
+            sell_status.average_fill_price if sell_status else 0,
+            starting_holdings,
+            final_holdings,
+        )
+
+    def _run_auto_cycle(self, once: bool = False) -> None:
+        if self.buy_only or self.sell_only:
+            if not self._is_within_trading_window():
+                self._log_auto_stopped("trading_window_closed")
+                return
+            self._run_trade_cycle()
+            return
+        if once:
+            self._run_auto_cycle_once()
+            return
+        if not self._is_within_trading_window():
+            self._run_auto_cycle_once()
+            return
+        while self._is_within_trading_window():
+            completed = self._run_auto_cycle_once()
+            if not completed:
+                break
+            if not self._is_within_trading_window():
+                logger.info("Trading window ended. Stopping trader.")
+                break
+            logger.info("Waiting for next auto-cycle after %s seconds.", config.polling_interval_seconds)
+            time.sleep(config.polling_interval_seconds)
+
     def _get_recent_orders_safe(self) -> list[dict[str, Any]]:
         """Retrieve recent orders with graceful error handling.
         
@@ -371,7 +681,7 @@ class SamsungTrader:
 
     def run_cycle(self, once: bool = False) -> None:
         logger.info(
-            "Starting Samsung Electronics auto trader. dry_run=%s paper_trading=%s offset=%s quantity=%s buy_only=%s sell_only=%s show_orders=%s report=%s inspect=%s",
+            "Starting Samsung Electronics auto trader. dry_run=%s paper_trading=%s offset=%s quantity=%s buy_only=%s sell_only=%s show_orders=%s report=%s inspect=%s auto_cycle=%s",
             self.dry_run,
             self.paper_trading,
             self.offset,
@@ -381,6 +691,7 @@ class SamsungTrader:
             self.show_orders,
             self.report,
             self.inspect,
+            self.auto_cycle,
         )
 
         if not self.paper_trading:
@@ -392,6 +703,10 @@ class SamsungTrader:
             return
 
         self._print_window_status()
+        if self.auto_cycle:
+            self._run_auto_cycle(once=once)
+            return
+
         if not self._is_within_trading_window():
             logger.info("Exiting because current time is outside the trading window.")
             return
@@ -426,6 +741,9 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--show-orders", action="store_true", help="Show recent order history.")
     parser.add_argument("--report", action="store_true", help="Create sanitized report outputs without exposing secrets.")
     parser.add_argument("--inspect", action="store_true", help="Inspect read-only account and order history without placing orders.")
+    parser.add_argument("--auto-cycle", action="store_true", help="Run a stateful mock buy-to-sell cycle using order-status polling.")
+    parser.add_argument("--order-status-timeout", type=float, default=120.0, help="Seconds to wait for each submitted order to finish.")
+    parser.add_argument("--order-status-poll-interval", type=float, default=5.0, help="Seconds between order-status polls.")
     parser.set_defaults(dry_run=True, paper_trading=True)
     return parser
 
@@ -449,6 +767,9 @@ def run_from_cli(argv: list[str] | None = None) -> None:
         show_orders=args.show_orders,
         report=args.report,
         inspect=args.inspect,
+        auto_cycle=args.auto_cycle,
+        order_status_timeout=args.order_status_timeout,
+        order_status_poll_interval=args.order_status_poll_interval,
     )
     trader.run_cycle(once=args.once)
 

@@ -11,7 +11,7 @@ from samsung_auto_trader.account import AccountService
 from samsung_auto_trader.orders import OrderService
 from samsung_auto_trader.price_utils import get_tick_size, normalize_order_price
 from samsung_auto_trader.trader import SamsungTrader
-from samsung_auto_trader.api_client import KISClient
+from samsung_auto_trader.api_client import KISClient, OrderStatus
 from samsung_auto_trader.config import config as app_config
 from samsung_auto_trader.kis_rate_limit import reset_kis_rate_limiter
 
@@ -118,6 +118,90 @@ class FakeOrderService(OrderService):
         return {"result": "sell_called"}
 
 
+def make_order_status(
+    order_number: str,
+    status: str,
+    side: str = "buy",
+    filled_quantity: int = 0,
+    ordered_quantity: int = 1,
+    remaining_quantity: int | None = None,
+    average_fill_price: int = 0,
+) -> OrderStatus:
+    if remaining_quantity is None:
+        remaining_quantity = max(0, ordered_quantity - filled_quantity)
+    return OrderStatus(
+        order_number=order_number,
+        side=side,
+        symbol="005930",
+        ordered_quantity=ordered_quantity,
+        filled_quantity=filled_quantity,
+        remaining_quantity=remaining_quantity,
+        order_price=70000,
+        average_fill_price=average_fill_price,
+        rejected_quantity=ordered_quantity if status == "REJECTED" else 0,
+        cancelled=status == "CANCELLED",
+        status=status,
+    )
+
+
+class AutoCycleClient(KISClient):
+    def __init__(
+        self,
+        holdings: list[int] | None = None,
+        buy_statuses: list[OrderStatus] | None = None,
+        sell_statuses: list[OrderStatus] | None = None,
+        recent_orders: dict[str, Any] | None = None,
+    ) -> None:
+        self.holdings = holdings or [0]
+        self.buy_statuses = buy_statuses or []
+        self.sell_statuses = sell_statuses or []
+        self.recent_orders = recent_orders or {"output1": []}
+        self.buying_power_calls: list[tuple[str, int]] = []
+        self.status_calls: list[str] = []
+        self.auth = self
+        self.token_source = "test"
+
+    def get_balance(self):
+        if len(self.holdings) > 1:
+            qty = self.holdings.pop(0)
+        else:
+            qty = self.holdings[0]
+        return {"output1": [{"pdno": "005930", "hldg_qty": str(qty)}], "output2": {"dnca_tot_amt": "1000000"}}
+
+    def get_price(self, symbol: str):
+        return {"output": {"stck_prpr": "100000"}}
+
+    def get_recent_daily_orders(self, days: int = 1):
+        return self.recent_orders
+
+    def get_buying_power(self, symbol: str, order_price: int):
+        self.buying_power_calls.append((symbol, order_price))
+        return {"buying_power_amount": 1000000, "buying_power_quantity": 10}
+
+    def get_order_status(self, order_number: str) -> OrderStatus:
+        self.status_calls.append(order_number)
+        if order_number == "B001":
+            if len(self.buy_statuses) > 1:
+                return self.buy_statuses.pop(0)
+            return self.buy_statuses[0]
+        if len(self.sell_statuses) > 1:
+            return self.sell_statuses.pop(0)
+        return self.sell_statuses[0]
+
+    def authenticate(self) -> str:
+        return "test-token"
+
+
+class AutoCycleOrderService(FakeOrderService):
+    def place_buy_order(self, symbol: str, quantity: int, price: int) -> dict[str, Any]:
+        super().place_buy_order(symbol, quantity, price)
+        return {"output": {"ODNO": "B001"}}
+
+    def place_sell_order(self, symbol: str, quantity: int, price: int) -> dict[str, Any]:
+        super().place_sell_order(symbol, quantity, price)
+        return {"output": {"ODNO": "S001"}}
+
+
 class TestPriceUtils(unittest.TestCase):
     def test_tick_size_boundaries(self):
         cases = [
@@ -157,6 +241,22 @@ class TestPriceUtils(unittest.TestCase):
 
 
 class TestSamsungTrader(unittest.TestCase):
+    def _open_market_time(self) -> datetime:
+        return datetime(2026, 6, 23, 10, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+
+    def _auto_trader(self, client: AutoCycleClient, order_service: AutoCycleOrderService) -> SamsungTrader:
+        return SamsungTrader(
+            offset=2000,
+            dry_run=False,
+            paper_trading=True,
+            quantity=1,
+            auto_cycle=True,
+            order_status_timeout=1,
+            order_status_poll_interval=0,
+            client=client,
+            order_service=order_service,
+        )
+
     def test_quantity_is_capped_and_at_least_one(self):
         payload = {
             "output1": [{"pdno": "005930", "hldg_qty": "0"}],
@@ -376,6 +476,187 @@ class TestSamsungTrader(unittest.TestCase):
         self.assertEqual(fake_order_service.buy_calls, 0)
         self.assertEqual(fake_order_service.sell_calls, 0)
         self.assertEqual(dummy_client.buying_power_calls, [("005930", 98000)])
+
+    def test_auto_cycle_buy_fills_then_sell_is_submitted(self):
+        client = AutoCycleClient(
+            holdings=[0, 1, 0],
+            buy_statuses=[make_order_status("B001", "FILLED", filled_quantity=1, average_fill_price=98000)],
+            sell_statuses=[make_order_status("S001", "FILLED", side="sell", filled_quantity=1, average_fill_price=102000)],
+        )
+        order_service = AutoCycleOrderService()
+        trader = self._auto_trader(client, order_service)
+        with patch.object(trader, "_now", return_value=self._open_market_time()):
+            with patch("samsung_auto_trader.trader.time.sleep", return_value=None):
+                completed = trader._run_auto_cycle_once()
+        self.assertTrue(completed)
+        self.assertEqual(order_service.buy_calls, 1)
+        self.assertEqual(order_service.sell_calls, 1)
+        self.assertEqual(order_service.sell_orders, [("005930", 1, 102000)])
+
+    def test_auto_cycle_waits_for_delayed_buy_holding_update_before_selling(self):
+        client = AutoCycleClient(
+            holdings=[0, 0, 1, 0],
+            buy_statuses=[make_order_status("B001", "FILLED", filled_quantity=1, average_fill_price=98000)],
+            sell_statuses=[make_order_status("S001", "FILLED", side="sell", filled_quantity=1, average_fill_price=102000)],
+        )
+        order_service = AutoCycleOrderService()
+        trader = self._auto_trader(client, order_service)
+        with patch.object(trader, "_now", return_value=self._open_market_time()):
+            with patch("samsung_auto_trader.trader.time.sleep", return_value=None):
+                completed = trader._run_auto_cycle_once()
+        self.assertTrue(completed)
+        self.assertEqual(order_service.buy_calls, 1)
+        self.assertEqual(order_service.sell_calls, 1)
+        self.assertEqual(order_service.sell_orders, [("005930", 1, 102000)])
+
+    def test_auto_cycle_waits_for_delayed_sell_holding_update(self):
+        client = AutoCycleClient(
+            holdings=[3, 4, 4, 3],
+            buy_statuses=[make_order_status("B001", "FILLED", filled_quantity=1, average_fill_price=98000)],
+            sell_statuses=[make_order_status("S001", "FILLED", side="sell", filled_quantity=1, average_fill_price=102000)],
+        )
+        order_service = AutoCycleOrderService()
+        trader = self._auto_trader(client, order_service)
+        with patch.object(trader, "_now", return_value=self._open_market_time()):
+            with patch("samsung_auto_trader.trader.time.sleep", return_value=None):
+                completed = trader._run_auto_cycle_once()
+        self.assertTrue(completed)
+        self.assertEqual(order_service.buy_calls, 1)
+        self.assertEqual(order_service.sell_calls, 1)
+        self.assertEqual(client.holdings[0], 3)
+
+    def test_auto_cycle_holding_confirmation_timeout_prevents_next_order(self):
+        client = AutoCycleClient(
+            holdings=[0, 0],
+            buy_statuses=[make_order_status("B001", "FILLED", filled_quantity=1, average_fill_price=98000)],
+        )
+        order_service = AutoCycleOrderService()
+        trader = self._auto_trader(client, order_service)
+        with patch.object(trader, "_now", return_value=self._open_market_time()):
+            with patch("samsung_auto_trader.trader.time.monotonic", side_effect=[0, 0, 2]):
+                completed = trader._run_auto_cycle_once()
+        self.assertFalse(completed)
+        self.assertEqual(order_service.buy_calls, 1)
+        self.assertEqual(order_service.sell_calls, 0)
+
+    def test_auto_cycle_pending_buy_prevents_sell_submission(self):
+        client = AutoCycleClient(
+            holdings=[0, 0],
+            buy_statuses=[make_order_status("B001", "PENDING")],
+        )
+        order_service = AutoCycleOrderService()
+        trader = self._auto_trader(client, order_service)
+        with patch.object(trader, "_now", return_value=self._open_market_time()):
+            with patch("samsung_auto_trader.trader.time.monotonic", side_effect=[0, 2]):
+                completed = trader._run_auto_cycle_once()
+        self.assertFalse(completed)
+        self.assertEqual(order_service.buy_calls, 1)
+        self.assertEqual(order_service.sell_calls, 0)
+
+    def test_auto_cycle_partially_filled_buy_prevents_sell_submission(self):
+        client = AutoCycleClient(
+            holdings=[0, 0],
+            buy_statuses=[make_order_status("B001", "PARTIALLY_FILLED", filled_quantity=1, ordered_quantity=2)],
+        )
+        order_service = AutoCycleOrderService()
+        trader = self._auto_trader(client, order_service)
+        with patch.object(trader, "_now", return_value=self._open_market_time()):
+            with patch("samsung_auto_trader.trader.time.monotonic", side_effect=[0, 2]):
+                completed = trader._run_auto_cycle_once()
+        self.assertFalse(completed)
+        self.assertEqual(order_service.buy_calls, 1)
+        self.assertEqual(order_service.sell_calls, 0)
+
+    def test_auto_cycle_rejected_buy_prevents_sell_submission(self):
+        client = AutoCycleClient(
+            holdings=[0, 0],
+            buy_statuses=[make_order_status("B001", "REJECTED")],
+        )
+        order_service = AutoCycleOrderService()
+        trader = self._auto_trader(client, order_service)
+        with patch.object(trader, "_now", return_value=self._open_market_time()):
+            completed = trader._run_auto_cycle_once()
+        self.assertFalse(completed)
+        self.assertEqual(order_service.buy_calls, 1)
+        self.assertEqual(order_service.sell_calls, 0)
+
+    def test_auto_cycle_cancelled_buy_prevents_sell_submission(self):
+        client = AutoCycleClient(
+            holdings=[0, 0],
+            buy_statuses=[make_order_status("B001", "CANCELLED")],
+        )
+        order_service = AutoCycleOrderService()
+        trader = self._auto_trader(client, order_service)
+        with patch.object(trader, "_now", return_value=self._open_market_time()):
+            completed = trader._run_auto_cycle_once()
+        self.assertFalse(completed)
+        self.assertEqual(order_service.buy_calls, 1)
+        self.assertEqual(order_service.sell_calls, 0)
+
+    def test_auto_cycle_buy_timeout_prevents_sell_submission(self):
+        client = AutoCycleClient(
+            holdings=[0, 0],
+            buy_statuses=[make_order_status("B001", "NOT_FOUND")],
+        )
+        order_service = AutoCycleOrderService()
+        trader = self._auto_trader(client, order_service)
+        with patch.object(trader, "_now", return_value=self._open_market_time()):
+            with patch("samsung_auto_trader.trader.time.monotonic", side_effect=[0, 2]):
+                completed = trader._run_auto_cycle_once()
+        self.assertFalse(completed)
+        self.assertEqual(order_service.buy_calls, 1)
+        self.assertEqual(order_service.sell_calls, 0)
+
+    def test_auto_cycle_existing_pending_order_blocks_duplicate_order(self):
+        pending_order = {
+            "odno": "EXISTING",
+            "ord_qty": "1",
+            "ord_unpr": "98000",
+            "tot_ccld_qty": "0",
+            "avg_prvs": "0",
+            "rmn_qty": "1",
+            "rjct_qty": "0",
+            "cncl_yn": "N",
+            "sll_buy_dvsn_cd_name": "매수",
+            "pdno": "005930",
+        }
+        client = AutoCycleClient(holdings=[0], recent_orders={"output1": [pending_order]})
+        order_service = AutoCycleOrderService()
+        trader = self._auto_trader(client, order_service)
+        with patch.object(trader, "_now", return_value=self._open_market_time()):
+            completed = trader._run_auto_cycle_once()
+        self.assertFalse(completed)
+        self.assertEqual(order_service.buy_calls, 0)
+        self.assertEqual(order_service.sell_calls, 0)
+
+    def test_auto_cycle_sell_fills_and_final_holdings_equal_baseline(self):
+        client = AutoCycleClient(
+            holdings=[3, 4, 3],
+            buy_statuses=[make_order_status("B001", "FILLED", filled_quantity=1, average_fill_price=98000)],
+            sell_statuses=[make_order_status("S001", "FILLED", side="sell", filled_quantity=1, average_fill_price=102000)],
+        )
+        order_service = AutoCycleOrderService()
+        trader = self._auto_trader(client, order_service)
+        with patch.object(trader, "_now", return_value=self._open_market_time()):
+            completed = trader._run_auto_cycle_once()
+        self.assertTrue(completed)
+        self.assertEqual(order_service.sell_calls, 1)
+        self.assertEqual(client.holdings[0], 3)
+
+    def test_auto_cycle_sell_timeout_stops_cycle(self):
+        client = AutoCycleClient(
+            holdings=[0, 1, 1],
+            buy_statuses=[make_order_status("B001", "FILLED", filled_quantity=1)],
+            sell_statuses=[make_order_status("S001", "PENDING", side="sell")],
+        )
+        order_service = AutoCycleOrderService()
+        trader = self._auto_trader(client, order_service)
+        with patch.object(trader, "_now", return_value=self._open_market_time()):
+            with patch("samsung_auto_trader.trader.time.monotonic", side_effect=[0, 0, 2, 4]):
+                completed = trader._run_auto_cycle_once()
+        self.assertFalse(completed)
+        self.assertEqual(order_service.buy_calls, 1)
+        self.assertEqual(order_service.sell_calls, 1)
 
     def test_buy_quantity_is_capped_by_buying_power_quantity(self):
         payload = {
@@ -632,6 +913,57 @@ class TestKISClient(unittest.TestCase):
             },
         )
         self.assertEqual(get.call_args.kwargs["headers"]["tr_id"], "VTTC8908R")
+
+    def test_get_order_status_matches_order_number_and_parses_daily_fill_row(self):
+        client = self._client_without_auth()
+        response = FakeResponse(
+            payload={
+                "rt_cd": "0",
+                "output1": [
+                    {
+                        "odno": "OTHER",
+                        "ord_qty": "1",
+                        "ord_unpr": "70000",
+                        "tot_ccld_qty": "0",
+                        "avg_prvs": "0",
+                        "rmn_qty": "1",
+                        "rjct_qty": "0",
+                        "cncl_yn": "N",
+                        "sll_buy_dvsn_cd_name": "매수",
+                        "pdno": "005930",
+                    },
+                    {
+                        "odno": "B001",
+                        "ord_qty": "2",
+                        "ord_unpr": "98000",
+                        "tot_ccld_qty": "1",
+                        "avg_prvs": "97900",
+                        "rmn_qty": "1",
+                        "rjct_qty": "0",
+                        "cncl_yn": "N",
+                        "sll_buy_dvsn_cd_name": "매수",
+                        "pdno": "005930",
+                    },
+                ],
+            },
+        )
+        with patch.dict(os.environ, {"KIS_MIN_REQUEST_INTERVAL_SECONDS": "0"}, clear=False):
+            with patch("samsung_auto_trader.api_client.requests.get", return_value=response) as get:
+                status = client.get_order_status("B001")
+
+        self.assertEqual(get.call_count, 1)
+        self.assertTrue(get.call_args.args[0].endswith("/uapi/domestic-stock/v1/trading/inquire-daily-ccld"))
+        self.assertEqual(status.order_number, "B001")
+        self.assertEqual(status.side, "buy")
+        self.assertEqual(status.symbol, "005930")
+        self.assertEqual(status.ordered_quantity, 2)
+        self.assertEqual(status.filled_quantity, 1)
+        self.assertEqual(status.remaining_quantity, 1)
+        self.assertEqual(status.order_price, 98000)
+        self.assertEqual(status.average_fill_price, 97900)
+        self.assertEqual(status.rejected_quantity, 0)
+        self.assertFalse(status.cancelled)
+        self.assertEqual(status.status, "PARTIALLY_FILLED")
 
     def test_place_order_http_500_error_is_sanitized(self):
         client = self._client_without_auth()

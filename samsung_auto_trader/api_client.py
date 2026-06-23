@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import time
 from typing import Any
 
@@ -9,6 +10,21 @@ from samsung_auto_trader.auth import KISAuth
 from samsung_auto_trader.config import config
 from samsung_auto_trader.kis_rate_limit import throttle_kis_request
 from samsung_auto_trader.logger import logger
+
+
+@dataclass
+class OrderStatus:
+    order_number: str
+    side: str
+    symbol: str
+    ordered_quantity: int
+    filled_quantity: int
+    remaining_quantity: int
+    order_price: int
+    average_fill_price: int
+    rejected_quantity: int
+    cancelled: bool
+    status: str
 
 
 class KISClient:
@@ -181,6 +197,80 @@ class KISClient:
             extra_headers={"tr_id": "VTTC0081R"},
         )
         return payload
+
+    def get_order_status(self, order_number: str) -> OrderStatus:
+        payload = self.get_recent_daily_orders(days=1)
+        rows = self._extract_order_rows(payload)
+        for row in rows:
+            row_order_number = str(row.get("odno") or row.get("ODNO") or "")
+            if row_order_number == order_number:
+                return self._parse_order_status(row)
+        return OrderStatus(
+            order_number=order_number,
+            side="",
+            symbol="",
+            ordered_quantity=0,
+            filled_quantity=0,
+            remaining_quantity=0,
+            order_price=0,
+            average_fill_price=0,
+            rejected_quantity=0,
+            cancelled=False,
+            status="NOT_FOUND",
+        )
+
+    def _extract_order_rows(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        output1 = payload.get("output1")
+        if isinstance(output1, dict):
+            return [output1]
+        if isinstance(output1, list):
+            return output1
+        output = payload.get("output")
+        if isinstance(output, dict):
+            return [output]
+        if isinstance(output, list):
+            return output
+        return []
+
+    def _parse_order_status(self, row: dict[str, Any]) -> OrderStatus:
+        ordered_quantity = self._parse_int(row.get("ord_qty"))
+        filled_quantity = self._parse_int(row.get("tot_ccld_qty"))
+        remaining_quantity = self._parse_int(row.get("rmn_qty"))
+        rejected_quantity = self._parse_int(row.get("rjct_qty"))
+        cancelled = str(row.get("cncl_yn") or "").upper() == "Y"
+        side_name = str(row.get("sll_buy_dvsn_cd_name") or "")
+
+        if "매수" in side_name or side_name.lower() == "buy":
+            side = "buy"
+        elif "매도" in side_name or side_name.lower() == "sell":
+            side = "sell"
+        else:
+            side = side_name
+
+        if cancelled:
+            status = "CANCELLED"
+        elif rejected_quantity > 0 and filled_quantity == 0:
+            status = "REJECTED"
+        elif ordered_quantity > 0 and filled_quantity >= ordered_quantity and remaining_quantity == 0:
+            status = "FILLED"
+        elif filled_quantity > 0:
+            status = "PARTIALLY_FILLED"
+        else:
+            status = "PENDING"
+
+        return OrderStatus(
+            order_number=str(row.get("odno") or row.get("ODNO") or ""),
+            side=side,
+            symbol=str(row.get("pdno") or ""),
+            ordered_quantity=ordered_quantity,
+            filled_quantity=filled_quantity,
+            remaining_quantity=remaining_quantity,
+            order_price=self._parse_int(row.get("ord_unpr")),
+            average_fill_price=self._parse_int(row.get("avg_prvs")),
+            rejected_quantity=rejected_quantity,
+            cancelled=cancelled,
+            status=status,
+        )
 
     def place_order(self, action: str, symbol: str, quantity: int, price: int, paper_trading: bool = True) -> dict[str, Any]:
         path = "/uapi/domestic-stock/v1/trading/order-cash"
