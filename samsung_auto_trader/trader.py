@@ -300,7 +300,11 @@ class SamsungTrader:
 
     def _is_pending_order_row(self, row: dict[str, Any], symbol: str) -> bool:
         status = self.client._parse_order_status(row)
-        return status.symbol.zfill(6) == symbol and status.status in ("PENDING", "PARTIALLY_FILLED")
+        return (
+            status.symbol.zfill(6) == symbol
+            and status.remaining_quantity > 0
+            and status.status in ("PENDING", "PARTIALLY_FILLED")
+        )
 
     def _has_existing_pending_order(self, orders: list[dict[str, Any]], symbol: str) -> bool:
         for row in orders:

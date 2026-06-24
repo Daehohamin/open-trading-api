@@ -755,6 +755,46 @@ class TestSamsungTrader(unittest.TestCase):
         self.assertEqual(order_service.buy_calls, 0)
         self.assertEqual(order_service.sell_calls, 0)
 
+    def test_auto_cycle_cancelled_sell_row_with_zero_remaining_does_not_block_duplicate_check(self):
+        cancelled_sell_order = {
+            "odno": "CANCELLED_SELL",
+            "ord_qty": "1",
+            "ord_unpr": "98500",
+            "tot_ccld_qty": "0",
+            "avg_prvs": "0",
+            "rmn_qty": "0",
+            "rjct_qty": "0",
+            "cncl_yn": "N",
+            "cncl_cfrm_qty": "1",
+            "sll_buy_dvsn_cd_name": "매도",
+            "pdno": "005930",
+        }
+        client = AutoCycleClient(holdings=[0])
+        order_service = AutoCycleOrderService()
+        trader = self._auto_trader(client, order_service)
+        self.assertFalse(trader._is_pending_order_row(cancelled_sell_order, "005930"))
+        self.assertFalse(trader._has_existing_pending_order([cancelled_sell_order], "005930"))
+
+    def test_auto_cycle_pending_row_with_remaining_quantity_still_blocks_duplicate_check(self):
+        pending_order = {
+            "odno": "PENDING_BUY",
+            "ord_qty": "1",
+            "ord_unpr": "98000",
+            "tot_ccld_qty": "0",
+            "avg_prvs": "0",
+            "rmn_qty": "1",
+            "rjct_qty": "0",
+            "cncl_yn": "N",
+            "cncl_cfrm_qty": "0",
+            "sll_buy_dvsn_cd_name": "매수",
+            "pdno": "005930",
+        }
+        client = AutoCycleClient(holdings=[0])
+        order_service = AutoCycleOrderService()
+        trader = self._auto_trader(client, order_service)
+        self.assertTrue(trader._is_pending_order_row(pending_order, "005930"))
+        self.assertTrue(trader._has_existing_pending_order([pending_order], "005930"))
+
     def test_auto_cycle_sell_fills_and_final_holdings_equal_baseline(self):
         client = AutoCycleClient(
             holdings=[3, 4, 3],
@@ -1090,6 +1130,46 @@ class TestKISClient(unittest.TestCase):
         self.assertEqual(status.rejected_quantity, 0)
         self.assertFalse(status.cancelled)
         self.assertEqual(status.status, "PARTIALLY_FILLED")
+
+    def test_parse_order_status_treats_cancel_confirmed_zero_remaining_as_cancelled(self):
+        client = self._client_without_auth()
+        row = {
+            "odno": "S001",
+            "ord_qty": "1",
+            "ord_unpr": "98500",
+            "tot_ccld_qty": "0",
+            "avg_prvs": "0",
+            "rmn_qty": "0",
+            "rjct_qty": "0",
+            "cncl_yn": "N",
+            "cncl_cfrm_qty": "1",
+            "sll_buy_dvsn_cd_name": "매도",
+            "pdno": "005930",
+        }
+        status = client._parse_order_status(row)
+        self.assertTrue(status.cancelled)
+        self.assertEqual(status.cancel_confirmed_quantity, 1)
+        self.assertEqual(status.remaining_quantity, 0)
+        self.assertEqual(status.status, "CANCELLED")
+
+    def test_parse_order_status_treats_cancel_side_name_as_cancelled(self):
+        client = self._client_without_auth()
+        row = {
+            "odno": "C001",
+            "ord_qty": "1",
+            "ord_unpr": "98500",
+            "tot_ccld_qty": "0",
+            "avg_prvs": "0",
+            "rmn_qty": "0",
+            "rjct_qty": "0",
+            "cncl_yn": "N",
+            "cncl_cfrm_qty": "0",
+            "sll_buy_dvsn_cd_name": "매도취소",
+            "pdno": "005930",
+        }
+        status = client._parse_order_status(row)
+        self.assertTrue(status.cancelled)
+        self.assertEqual(status.status, "CANCELLED")
 
     def test_place_order_http_500_error_is_sanitized(self):
         client = self._client_without_auth()

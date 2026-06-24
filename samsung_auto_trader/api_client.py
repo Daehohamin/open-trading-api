@@ -25,6 +25,7 @@ class OrderStatus:
     rejected_quantity: int
     cancelled: bool
     status: str
+    cancel_confirmed_quantity: int = 0
 
 
 class KISClient:
@@ -237,8 +238,13 @@ class KISClient:
         filled_quantity = self._parse_int(row.get("tot_ccld_qty"))
         remaining_quantity = self._parse_int(row.get("rmn_qty"))
         rejected_quantity = self._parse_int(row.get("rjct_qty"))
-        cancelled = str(row.get("cncl_yn") or "").upper() == "Y"
+        cancel_confirmed_quantity = self._parse_int(row.get("cncl_cfrm_qty"))
         side_name = str(row.get("sll_buy_dvsn_cd_name") or "")
+        cancelled = (
+            str(row.get("cncl_yn") or "").upper() == "Y"
+            or "취소" in side_name
+            or (cancel_confirmed_quantity > 0 and remaining_quantity == 0)
+        )
 
         if "매수" in side_name or side_name.lower() == "buy":
             side = "buy"
@@ -270,6 +276,7 @@ class KISClient:
             rejected_quantity=rejected_quantity,
             cancelled=cancelled,
             status=status,
+            cancel_confirmed_quantity=cancel_confirmed_quantity,
         )
 
     def place_order(self, action: str, symbol: str, quantity: int, price: int, paper_trading: bool = True) -> dict[str, Any]:
