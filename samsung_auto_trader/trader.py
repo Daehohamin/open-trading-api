@@ -42,6 +42,9 @@ class SamsungTrader:
         report: bool = False,
         inspect: bool = False,
         auto_cycle: bool = False,
+        buy_offset: int | None = None,
+        take_profit: int | None = None,
+        cycle_count: int | None = None,
         order_status_timeout: float = 120.0,
         order_status_poll_interval: float = 5.0,
         client: KISClient | None = None,
@@ -59,6 +62,9 @@ class SamsungTrader:
         self.report = report
         self.inspect = inspect
         self.auto_cycle = auto_cycle
+        self.buy_offset = buy_offset
+        self.take_profit = take_profit
+        self.cycle_count = cycle_count
         self.order_status_timeout = order_status_timeout
         self.order_status_poll_interval = order_status_poll_interval
 
@@ -379,7 +385,8 @@ class SamsungTrader:
         if current_price is None:
             self._log_auto_stopped("price_unavailable")
             return False
-        raw_buy_price = current_price - self.offset
+        effective_buy_offset = self.buy_offset if self.buy_offset is not None else self.offset
+        raw_buy_price = current_price - effective_buy_offset
         buy_price = normalize_order_price(raw_buy_price, "buy")
         if buy_price != raw_buy_price:
             logger.info(
@@ -420,6 +427,10 @@ class SamsungTrader:
             self._log_auto_stopped(f"buy_{buy_status.status.lower()}")
             self._print_auto_summary(buy_status, None, baseline_quantity, self._account_holding_quantity())
             return False
+        if buy_status.filled_quantity < quantity or buy_status.remaining_quantity > 0:
+            self._log_auto_stopped("buy_not_fully_filled")
+            self._print_auto_summary(buy_status, None, baseline_quantity, self._account_holding_quantity())
+            return False
         logger.info("AUTO_STATE=BUY_FILLED order_number=%s", buy_order_number)
 
         expected_after_buy = baseline_quantity + quantity
@@ -434,12 +445,24 @@ class SamsungTrader:
             self._print_auto_summary(buy_status, None, baseline_quantity, after_buy_quantity)
             return False
 
-        latest_price = self.market_data.get_current_price(config.symbol)
-        if latest_price is None:
-            self._log_auto_stopped("sell_price_unavailable")
-            self._print_auto_summary(buy_status, None, baseline_quantity, after_buy_quantity)
-            return False
-        raw_sell_price = latest_price + self.offset
+        if self.take_profit is None:
+            latest_price = self.market_data.get_current_price(config.symbol)
+            if latest_price is None:
+                self._log_auto_stopped("sell_price_unavailable")
+                self._print_auto_summary(buy_status, None, baseline_quantity, after_buy_quantity)
+                return False
+            raw_sell_price = latest_price + self.offset
+        else:
+            buy_average_fill_price = buy_status.average_fill_price or buy_price
+            raw_sell_price = buy_average_fill_price + self.take_profit
+            sell_price_for_log = normalize_order_price(raw_sell_price, "sell")
+            logger.info(
+                "Take-profit sell target: buy_average_fill_price=%s take_profit=%s raw_sell_price=%s normalized_sell_price=%s",
+                buy_average_fill_price,
+                self.take_profit,
+                raw_sell_price,
+                sell_price_for_log,
+            )
         sell_price = normalize_order_price(raw_sell_price, "sell")
         if sell_price != raw_sell_price:
             logger.info(
@@ -525,9 +548,14 @@ class SamsungTrader:
         if not self._is_within_trading_window():
             self._run_auto_cycle_once()
             return
+        completed_cycles = 0
         while self._is_within_trading_window():
             completed = self._run_auto_cycle_once()
             if not completed:
+                break
+            completed_cycles += 1
+            if self.cycle_count is not None and completed_cycles >= self.cycle_count:
+                logger.info("AUTO_STATE=COMPLETE cycle_count=%s", completed_cycles)
                 break
             if not self._is_within_trading_window():
                 logger.info("Trading window ended. Stopping trader.")
@@ -693,6 +721,12 @@ class SamsungTrader:
             self.inspect,
             self.auto_cycle,
         )
+        logger.info(
+            "AUTO_CONFIG buy_offset=%s take_profit=%s cycle_count=%s",
+            self.buy_offset,
+            self.take_profit,
+            self.cycle_count,
+        )
 
         if not self.paper_trading:
             logger.error("Real trading is disabled. paper_trading must remain enabled.")
@@ -734,6 +768,9 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--paper-trading", dest="paper_trading", action="store_true", help="Enable paper trading mode.")
     parser.add_argument("--no-paper-trading", dest="paper_trading", action="store_false", help="Disable paper trading mode (not supported).")
     parser.add_argument("--offset", type=int, help="ORDER_OFFSET_KRW to use for buy/sell levels.")
+    parser.add_argument("--buy-offset", type=int, help="Optional auto-cycle buy offset. Defaults to --offset behavior when omitted.")
+    parser.add_argument("--take-profit", type=int, help="Optional auto-cycle sell target above the buy average fill price.")
+    parser.add_argument("--cycle-count", type=int, help="Maximum completed auto-cycle attempts to run.")
     parser.add_argument("--quantity", type=int, default=config.default_order_quantity, help="Order quantity for buy/sell actions.")
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--buy-only", action="store_true", help="Only place buy orders.")
@@ -756,6 +793,8 @@ def run_from_cli(argv: list[str] | None = None) -> None:
         parser.error("--no-dry-run must be accompanied by --confirm-paper-order to allow paper order submission.")
     if args.paper_trading is False:
         parser.error("Real trading is disabled. Use paper trading only.")
+    if args.cycle_count is not None and args.cycle_count <= 0:
+        parser.error("--cycle-count must be a positive integer.")
 
     trader = SamsungTrader(
         offset=args.offset,
@@ -768,6 +807,9 @@ def run_from_cli(argv: list[str] | None = None) -> None:
         report=args.report,
         inspect=args.inspect,
         auto_cycle=args.auto_cycle,
+        buy_offset=args.buy_offset,
+        take_profit=args.take_profit,
+        cycle_count=args.cycle_count,
         order_status_timeout=args.order_status_timeout,
         order_status_poll_interval=args.order_status_poll_interval,
     )
