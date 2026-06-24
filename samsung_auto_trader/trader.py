@@ -141,6 +141,110 @@ class SamsungTrader:
             sanitized[key] = value
         return sanitized
 
+    def _parse_int_display(self, value: Any) -> int | None:
+        if value in (None, ""):
+            return None
+        try:
+            return int(float(str(value).replace(",", "")))
+        except (TypeError, ValueError):
+            return None
+
+    def format_krw(self, value: Any) -> str:
+        amount = self._parse_int_display(value)
+        if amount is None:
+            return "조회불가"
+        return f"{amount:,}원"
+
+    def _format_quantity(self, value: Any) -> str:
+        quantity = self._parse_int_display(value)
+        if quantity is None:
+            return "조회불가"
+        return f"{quantity:,}주"
+
+    def _format_percent(self, value: Any) -> str:
+        if value in (None, ""):
+            return "조회불가"
+        try:
+            percent = float(str(value).replace(",", ""))
+        except (TypeError, ValueError):
+            return "조회불가"
+        return f"{percent:.2f}%"
+
+    def _format_symbol_name(self, symbol: str) -> str:
+        normalized_symbol = symbol.zfill(6)
+        if normalized_symbol == config.symbol:
+            return f"삼성전자({normalized_symbol})"
+        return normalized_symbol
+
+    def _format_order_side_korean(self, row: dict[str, Any], parsed_status: OrderStatus) -> str:
+        side_name = str(row.get("sll_buy_dvsn_cd_name") or "").strip()
+        if side_name:
+            if "취소" in side_name:
+                return side_name
+            if "매수" in side_name:
+                return "매수"
+            if "매도" in side_name:
+                return "매도"
+        if parsed_status.side == "buy":
+            return "매수"
+        if parsed_status.side == "sell":
+            return "매도"
+        return parsed_status.side or "조회불가"
+
+    def _format_order_status_korean(self, status: str) -> str:
+        return {
+            "FILLED": "전량체결",
+            "PENDING": "미체결",
+            "CANCELLED": "취소",
+            "PARTIALLY_FILLED": "부분체결",
+            "REJECTED": "거절",
+            "NOT_FOUND": "조회불가",
+        }.get(status, status or "조회불가")
+
+    def format_order_row_korean(self, row: dict[str, Any]) -> str:
+        parsed_status = self.client._parse_order_status(row)
+        lines = [
+            "[최근 주문 요약]",
+            f"주문번호: {parsed_status.order_number or '조회불가'}",
+            f"구분: {self._format_order_side_korean(row, parsed_status)}",
+            f"종목: {self._format_symbol_name(parsed_status.symbol or str(row.get('pdno') or ''))}",
+            f"주문가: {self.format_krw(parsed_status.order_price)}",
+            f"주문수량: {self._format_quantity(parsed_status.ordered_quantity)}",
+            f"체결수량: {self._format_quantity(parsed_status.filled_quantity)}",
+            f"미체결수량: {self._format_quantity(parsed_status.remaining_quantity)}",
+            f"평균체결가: {self.format_krw(parsed_status.average_fill_price)}",
+            f"상태: {self._format_order_status_korean(parsed_status.status)}",
+        ]
+        return "\n".join(lines)
+
+    def format_holding_korean(self, holding: dict[str, Any], current_price: int | None = None) -> str:
+        symbol = str(holding.get("pdno") or config.symbol)
+        current_price_value = current_price if current_price is not None else holding.get("prpr")
+        profit_loss = holding.get("evlu_pfls_amt") or holding.get("evlu_pfls")
+        profit_loss_rate = holding.get("evlu_pfls_rt") or holding.get("evlu_erng_rt")
+        lines = [
+            f"종목: {self._format_symbol_name(symbol)}",
+            f"보유수량: {self._format_quantity(holding.get('hldg_qty'))}",
+            f"주문가능수량: {self._format_quantity(holding.get('ord_psbl_qty'))}",
+            f"매입평균가: {self.format_krw(holding.get('pchs_avg_pric'))}",
+            f"매입금액: {self.format_krw(holding.get('pchs_amt'))}",
+            f"현재가: {self.format_krw(current_price_value)}",
+            f"평가금액: {self.format_krw(holding.get('evlu_amt'))}",
+            f"평가손익: {self.format_krw(profit_loss)} ({self._format_percent(profit_loss_rate)})",
+        ]
+        return "\n".join(lines)
+
+    def format_account_snapshot_korean(self, snapshot: dict[str, Any], current_price: int | None = None) -> str:
+        holding = self.account_service.find_holding(snapshot.get("holdings", []), config.symbol) or {}
+        lines = [
+            "[계좌 요약]",
+            f"예수금총액: {self.format_krw(snapshot.get('deposit_total'))}",
+            f"익일정산금액: {self.format_krw(snapshot.get('next_day_settlement_amount'))}",
+            f"가수도정산금액: {self.format_krw(snapshot.get('provisional_settlement_amount'))}",
+            self.format_holding_korean(holding, current_price=current_price),
+        ]
+        return "\n".join(lines)
+
     def _extract_orders(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
         if not payload:
             return []
@@ -237,7 +341,8 @@ class SamsungTrader:
 
         logger.info("Recent order history (%s rows):", len(orders))
         for row in orders:
-            logger.info("  %s", {k: v for k, v in row.items()})
+            logger.info("\n%s", self.format_order_row_korean(row))
+            logger.debug("Raw recent order row: %s", {k: v for k, v in row.items()})
         return orders
 
     def _record_execution(self, before_snapshot: dict[str, Any], after_snapshot: dict[str, Any]) -> bool:
@@ -603,12 +708,13 @@ class SamsungTrader:
         if self.show_orders and orders:
             logger.info("Recent order history (%s rows):", len(orders))
             for row in orders:
-                logger.info("  %s", {k: v for k, v in row.items()})
+                logger.info("\n%s", self.format_order_row_korean(row))
+                logger.debug("Raw recent order row: %s", {k: v for k, v in row.items()})
         
         logger.info("Token reuse source: %s", self.client.auth.token_source)
-        logger.info("Current price: %s", current_price)
-        logger.info(
-            "Account snapshot: deposit_total=%s next_day_settlement_amount=%s provisional_settlement_amount=%s holdings=%s",
+        logger.info("\n%s", self.format_account_snapshot_korean(snapshot, current_price=current_price))
+        logger.debug(
+            "Raw account snapshot: deposit_total=%s next_day_settlement_amount=%s provisional_settlement_amount=%s holdings=%s",
             snapshot.get("deposit_total"),
             snapshot.get("next_day_settlement_amount"),
             snapshot.get("provisional_settlement_amount"),

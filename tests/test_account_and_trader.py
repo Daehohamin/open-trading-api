@@ -923,6 +923,99 @@ class TestSamsungTrader(unittest.TestCase):
             finally:
                 object.__setattr__(app_config, "outputs_dir", original_outputs_dir)
 
+    def test_order_row_korean_summary_maps_filled_and_remaining_quantities(self):
+        trader = SamsungTrader(dry_run=True, paper_trading=True, quantity=1, client=DummyClient())
+        row = {
+            "odno": "B001",
+            "ord_qty": "3",
+            "ord_unpr": "70000",
+            "tot_ccld_qty": "2",
+            "avg_prvs": "70100",
+            "rmn_qty": "1",
+            "rjct_qty": "0",
+            "cncl_yn": "N",
+            "sll_buy_dvsn_cd_name": "매수",
+            "pdno": "005930",
+        }
+        with patch("samsung_auto_trader.api_client.requests.get") as get:
+            with patch("samsung_auto_trader.api_client.requests.post") as post:
+                summary = trader.format_order_row_korean(row)
+        get.assert_not_called()
+        post.assert_not_called()
+        self.assertIn("체결수량: 2주", summary)
+        self.assertIn("미체결수량: 1주", summary)
+
+    def test_holding_korean_summary_maps_holding_quantity_and_average_buy_price(self):
+        trader = SamsungTrader(dry_run=True, paper_trading=True, quantity=1, client=DummyClient())
+        holding = {
+            "pdno": "005930",
+            "hldg_qty": "4",
+            "ord_psbl_qty": "3",
+            "pchs_avg_pric": "71000",
+            "pchs_amt": "284000",
+            "evlu_amt": "300000",
+            "evlu_pfls_amt": "16000",
+            "evlu_pfls_rt": "5.63",
+        }
+        with patch("samsung_auto_trader.api_client.requests.get") as get:
+            with patch("samsung_auto_trader.api_client.requests.post") as post:
+                summary = trader.format_holding_korean(holding, current_price=75000)
+        get.assert_not_called()
+        post.assert_not_called()
+        self.assertIn("보유수량: 4주", summary)
+        self.assertIn("매입평균가: 71,000원", summary)
+
+    def test_cancelled_order_with_cancel_confirmed_quantity_is_summarized_as_cancelled(self):
+        trader = SamsungTrader(dry_run=True, paper_trading=True, quantity=1, client=DummyClient())
+        row = {
+            "odno": "S001",
+            "ord_qty": "1",
+            "ord_unpr": "98500",
+            "tot_ccld_qty": "0",
+            "avg_prvs": "0",
+            "rmn_qty": "0",
+            "rjct_qty": "0",
+            "cncl_yn": "N",
+            "cncl_cfrm_qty": "1",
+            "sll_buy_dvsn_cd_name": "매도",
+            "pdno": "005930",
+        }
+        with patch("samsung_auto_trader.api_client.requests.get") as get:
+            with patch("samsung_auto_trader.api_client.requests.post") as post:
+                summary = trader.format_order_row_korean(row)
+        get.assert_not_called()
+        post.assert_not_called()
+        self.assertIn("상태: 취소", summary)
+        self.assertIn("미체결수량: 0주", summary)
+
+    def test_account_snapshot_korean_summary_uses_holding_fields_without_external_requests(self):
+        trader = SamsungTrader(dry_run=True, paper_trading=True, quantity=1, client=DummyClient())
+        snapshot = {
+            "deposit_total": 1000000,
+            "next_day_settlement_amount": 200000,
+            "provisional_settlement_amount": 300000,
+            "holdings": [
+                {
+                    "pdno": "005930",
+                    "hldg_qty": "5",
+                    "ord_psbl_qty": "4",
+                    "pchs_avg_pric": "70000",
+                    "pchs_amt": "350000",
+                    "evlu_amt": "360000",
+                    "evlu_pfls_amt": "10000",
+                    "evlu_pfls_rt": "2.86",
+                }
+            ],
+        }
+        with patch("samsung_auto_trader.api_client.requests.get") as get:
+            with patch("samsung_auto_trader.api_client.requests.post") as post:
+                summary = trader.format_account_snapshot_korean(snapshot, current_price=72000)
+        get.assert_not_called()
+        post.assert_not_called()
+        self.assertIn("[계좌 요약]", summary)
+        self.assertIn("보유수량: 5주", summary)
+        self.assertIn("매입평균가: 70,000원", summary)
+
     def test_no_sensitive_logs_and_csv_on_error(self):
         """Ensure logs do not contain CANO/account/appkey/appsecret/token/authorization or query strings."""
         # inject sensitive-looking values into environment variables

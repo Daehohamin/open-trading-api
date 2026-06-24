@@ -69,6 +69,12 @@ python -m samsung_auto_trader.main \
   --show-orders
 ```
 
+동일 명령을 한 줄로 실행할 수도 있습니다.
+
+```bash
+python -m samsung_auto_trader.main --inspect --show-orders
+```
+
 이 명령은 주문을 제출하지 않고 다음 항목만 조회합니다.
 
 1. 삼성전자 현재가
@@ -76,6 +82,9 @@ python -m samsung_auto_trader.main \
 3. 삼성전자 보유수량
 4. 최근 모의투자 주문내역
 5. 당일 token cache 재사용 여부
+
+`--inspect --show-orders` 출력은 최근 주문 상태와 보유잔고를 인터뷰 시연에 적합한 한국어 요약으로 표시합니다.
+예를 들어 `tot_ccld_qty`는 체결수량, `rmn_qty`는 미체결수량, `hldg_qty`는 보유수량, `pchs_avg_pric`는 매입평균가로 표시됩니다.
 
 보고서 파일도 새로 생성하려면 다음 명령을 사용합니다.
 
